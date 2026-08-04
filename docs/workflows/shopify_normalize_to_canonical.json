@@ -1,0 +1,368 @@
+{
+ "name": "shopify_normalize_to_canonical",
+ "nodes": [
+  {
+   "parameters": {},
+   "id": "trigger",
+   "name": "When Called by Another Workflow",
+   "type": "n8n-nodes-base.executeWorkflowTrigger",
+   "typeVersion": 1,
+   "position": [
+    200,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "SELECT id, raw_payload FROM public.raw_orders WHERE id = $1::bigint LIMIT 1",
+    "options": {
+     "queryReplacement": "={{ $json.raw_id }}"
+    }
+   },
+   "id": "load-raw",
+   "name": "Load raw_orders row",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    420,
+    300
+   ],
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "parameters": {
+    "jsCode": "const envelope = $('When Called by Another Workflow').first().json;\nconst rawRow = $input.first().json;\nif (!rawRow || !rawRow.id) {\n  return [{ json: { ok: false, http_status: 400, kind: 'bad_payload', message: 'raw_id_not_found' } }];\n}\nconst order = rawRow.raw_payload;\nconst location_key = envelope.location_key;\nconst external_ref = envelope.external_ref;\n\nfunction eurosToCents(s) { if (s == null) return 0; const n = typeof s === 'number' ? s : Number(s); return Number.isFinite(n) ? Math.round(n * 100) : 0; }\nconst GATEWAY_MAP = { shopify_payments: 'card_online', bogus: 'card_online', stripe: 'card_online', bancontact: 'bancontact', manual: 'cash', cod: 'cash', gift_card: 'voucher' };\nfunction gatewayToMethod(g, names) { const gRaw = g || (Array.isArray(names) && names[0]) || null; if (!gRaw) return 'other'; const k = String(gRaw).toLowerCase().trim(); if (GATEWAY_MAP[k]) return GATEWAY_MAP[k]; if (k.includes('cash') || k.includes('cod')) return 'cash'; if (k.includes('bancontact')) return 'bancontact'; if (k.includes('gift')) return 'voucher'; return 'other'; }\nfunction finStatusToPaymentStatus(s) { switch (s) { case 'paid': case 'authorized': case 'partially_paid': return 'paid'; case 'pending': return 'pending'; case 'refunded': return 'refunded'; case 'partially_refunded': return 'partial_refund'; case 'voided': case 'expired': return 'failed'; default: return 'pending'; } }\nfunction extractUtm(arr) { if (!arr || !arr.length) return null; const m = new Map(arr.map(a => [a.name.toLowerCase(), a.value])); const get = k => { const v = m.get(k); return (v != null && v !== '') ? v : null; }; const u = { source: get('utm_source'), medium: get('utm_medium'), campaign: get('utm_campaign'), term: get('utm_term'), content: get('utm_content'), referrer_url: get('referrer') ?? get('referrer_url'), landing_page_url: get('landing_page') ?? get('landing_page_url') }; return Object.values(u).some(v => v !== null) ? u : null; }\n\n// Compound SKU split: Shopify variants encode product+modifiers as 'B11__Veelsaus' or 'B17__ck3__colamenu'.\n// Lightspeed catalog has only base PLU (B11, B17). We split on '__' and emit modifiers separately.\n// parts[0] = base PLU sent as productPlu; parts[1..n] = modifier codes, paired with li.variant_title segments for human-readable names.\nfunction splitCompoundSku(rawSku, variantTitle) {\n  const parts = String(rawSku).split('__');\n  const basePlu = parts[0];\n  const modifierCodes = parts.slice(1);\n  const vt = (variantTitle || '').trim();\n  const modifierNames = (vt && vt !== 'Default Title') ? vt.split(' / ').map(p => p.trim()).filter(Boolean) : [];\n  const modifiers = modifierCodes.map((code, idx) => ({ plu: '', name: modifierNames[idx] || code, unit_price_cents: 0 }));\n  return { basePlu, modifiers };\n}\n\ntry {\n  if (!order || !Array.isArray(order.line_items) || order.line_items.length === 0 || !order.name) {\n    return [{ json: { ok: false, http_status: 400, kind: 'bad_payload', message: 'invalid_shopify_payload' } }];\n  }\n  // A2: Shopify Local Pickup still sends shipping_lines + shipping_address (the shop's own\n  // address), so presence alone misclassified ~10% of orders as delivery. Classify from the\n  // shipping method title/code instead (Berlare: 'Afhaal [_230]', Aalst: 'Ophalen in frituur [_237]').\n  const shipLine = (order.shipping_lines && order.shipping_lines[0]) || {};\n  const shipLabel = String((shipLine.title || '') + ' ' + (shipLine.code || '')).toLowerCase();\n  const isPickupMethod = /afhaal|afhalen|ophalen|pick[- ]?up|pickup/.test(shipLabel);\n  const isDelivery = !isPickupMethod && ((Array.isArray(order.shipping_lines) && order.shipping_lines.length > 0) || order.shipping_address != null);\n  const fullName = [order.customer?.first_name, order.customer?.last_name].filter(Boolean).join(' ').trim() || 'Guest';\n  const items = order.line_items.map(li => {\n    const rawSku = (li.sku && li.sku.length > 0) ? li.sku : ('SHOP-' + li.id);\n    const { basePlu, modifiers } = splitCompoundSku(rawSku, li.variant_title);\n    const it = { plu: basePlu, name: li.name, qty: li.quantity, unit_price_cents: eurosToCents(li.price) };\n    if (modifiers.length > 0) it.modifiers = modifiers;\n    const noteProp = (li.properties || []).find(p => p.name && p.name.toLowerCase() === 'notes');\n    if (noteProp) it.notes = noteProp.value;\n    return it;\n  });\n  // A5: 71% of orders had no phone \u2014 customer.phone is usually empty but shipping_address.phone\n  // is filled. Fall back through all sources and normalize Belgian numbers to E.164.\n  function normPhone(p) {\n    if (!p) return null;\n    const s = String(p).replace(/[\\s\\/.\\-()]/g, '');\n    if (/^\\+/.test(s)) return s;\n    if (/^00/.test(s)) return '+' + s.slice(2);\n    if (/^0\\d{8,9}$/.test(s)) return '+32' + s.slice(1);\n    return s || null;\n  }\n  const phone = normPhone(order.customer?.phone) ?? normPhone(order.shipping_address?.phone) ?? normPhone(order.billing_address?.phone) ?? normPhone(order.phone) ?? null;\n  const customer = { name: fullName, email: order.customer?.email ?? null, phone, address: null };\n  if (isDelivery && order.shipping_address) {\n    const a = order.shipping_address;\n    // A6: line2 hygiene \u2014 drop it when it merely repeats line1 (\"Leeuwerikenlaan 19\" + \"19\")\n    // or contains a stray postal code (\"9310\"); keep real bus/floor suffixes.\n    let line2 = a.address2 != null ? String(a.address2).trim() : null;\n    if (line2) {\n      const l1n = String(a.address1 || '').toLowerCase().replace(/\\s+/g, '');\n      const l2n = line2.toLowerCase().replace(/\\s+/g, '');\n      if (!l2n || /^\\d{4}$/.test(l2n) || l1n.includes(l2n)) line2 = null;\n    }\n    customer.address = { line1: a.address1, line2, postal_code: a.zip, city: a.city, country: (a.country_code ?? 'BE').toUpperCase().slice(0,2), lat: a.latitude ?? null, lng: a.longitude ?? null };\n    // Delivery address without any house number \u2014 don't block the order, but flag it for\n    // the counter/driver (surfaces via KLANT note on the LS ticket + Shipday instruction).\n    const hasNumber = /\\d/.test(String(a.address1 || '') + String(line2 || ''));\n    if (!hasNumber) customer.notes = 'LET OP: huisnummer ontbreekt in adres \u2014 bel klant';\n  }\n  const totalCents = eurosToCents(order.total_price);\n  const buckets = new Map();\n  const add = (rate, base, vat) => { const rb = Math.round(rate * 10000); const c = buckets.get(rb) ?? { base: 0, vat: 0 }; c.base += base; c.vat += vat; buckets.set(rb, c); };\n  for (const li of order.line_items) {\n    const gross = eurosToCents(li.price) * li.quantity;\n    const taxes = li.tax_lines || [];\n    if (!taxes.length) add(0, gross, 0);\n    else for (const tl of taxes) { const v = eurosToCents(tl.price); add(tl.rate, gross - v, v); }\n  }\n  for (const sl of order.shipping_lines || []) { const sg = eurosToCents(sl.price); if (sg > 0) add(0.21, sg, 0); }\n  const vat_lines = Array.from(buckets.entries()).filter(([, v]) => v.base > 0 || v.vat > 0).map(([rb, v]) => ({ rate_bp: rb, base_cents: v.base, vat_cents: v.vat }));\n  let sum = vat_lines.reduce((a, l) => a + l.base_cents + l.vat_cents, 0);\n  if (vat_lines.length && sum !== totalCents) { let idx = 0; for (let i = 1; i < vat_lines.length; i++) if (vat_lines[i].base_cents > vat_lines[idx].base_cents) idx = i; vat_lines[idx].base_cents = Math.max(0, vat_lines[idx].base_cents + (totalCents - sum)); }\n  const canonical = { schema_version: '1.1', source: 'shopify', external_ref, location_key, order_type: isDelivery ? 'delivery' : 'pickup', status: 'received', customer, items, payment: { method: gatewayToMethod(order.gateway, order.payment_gateway_names), status: finStatusToPaymentStatus(order.financial_status), total_cents: totalCents, currency: 'EUR' }, vat_lines, utm: extractUtm(order.note_attributes), refund_markers: null, cancel_reason: null };\n  return [{ json: { ok: true, canonical, raw_id: rawRow.id, location_key, external_ref, is_delivery: isDelivery } }];\n} catch (e) {\n  return [{ json: { ok: false, http_status: 400, kind: 'bad_payload', message: 'normalizer_threw: ' + (e.message || 'unknown') } }];\n}\n"
+   },
+   "id": "normalize",
+   "name": "Normalize Shopify to Canonical",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    640,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "rules": {
+     "values": [
+      {
+       "outputKey": "ok",
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "typeValidation": "strict"
+        },
+        "combinator": "and",
+        "conditions": [
+         {
+          "leftValue": "={{ $json.ok }}",
+          "rightValue": true,
+          "operator": {
+           "type": "boolean",
+           "operation": "true"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "options": {
+     "fallbackOutput": "extra"
+    }
+   },
+   "id": "branch-normalize-result",
+   "name": "Normalize OK?",
+   "type": "n8n-nodes-base.switch",
+   "typeVersion": 3,
+   "position": [
+    860,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "INSERT INTO public.canonical_orders (\n  schema_version, source, external_ref, location_key, order_type, status,\n  customer, items, payment, vat_lines, utm, raw_payload_id\n) VALUES (\n  '1.1', 'shopify'::public.order_source, $1, $2, $3::public.order_channel_type,\n  'received'::public.order_state,\n  $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9::bigint\n)\nON CONFLICT (source, external_ref) DO UPDATE SET\n  items = EXCLUDED.items,\n  payment = EXCLUDED.payment,\n  vat_lines = EXCLUDED.vat_lines,\n  customer = EXCLUDED.customer,\n  order_type = EXCLUDED.order_type,\n  utm = COALESCE(canonical_orders.utm, EXCLUDED.utm),\n  updated_at = now()\nWHERE canonical_orders.location_key = EXCLUDED.location_key\nRETURNING id, (xmax = 0) AS was_inserted, status",
+    "options": {
+     "queryReplacement": "={{ $('Normalize Shopify to Canonical').item.json.canonical.external_ref }},={{ $('Normalize Shopify to Canonical').item.json.canonical.location_key }},={{ $('Normalize Shopify to Canonical').item.json.canonical.order_type }},={{ JSON.stringify($('Normalize Shopify to Canonical').item.json.canonical.customer) }},={{ JSON.stringify($('Normalize Shopify to Canonical').item.json.canonical.items) }},={{ JSON.stringify($('Normalize Shopify to Canonical').item.json.canonical.payment) }},={{ JSON.stringify($('Normalize Shopify to Canonical').item.json.canonical.vat_lines) }},={{ $('Normalize Shopify to Canonical').item.json.canonical.utm ? JSON.stringify($('Normalize Shopify to Canonical').item.json.canonical.utm) : null }},={{ $('Normalize Shopify to Canonical').item.json.raw_id }}"
+    }
+   },
+   "id": "insert-canonical",
+   "name": "INSERT canonical_orders",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    1480,
+    50
+   ],
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "WITH inserted AS (\n  SELECT id FROM public.canonical_orders WHERE source = 'shopify'::public.order_source AND external_ref = $1 LIMIT 1\n)\nUPDATE public.canonical_orders SET status = 'normalized'::public.order_state\n WHERE id = (SELECT id FROM inserted) AND status = 'received'::public.order_state\nRETURNING id, status",
+    "options": {
+     "queryReplacement": "={{ $('Normalize Shopify to Canonical').item.json.canonical.external_ref }}"
+    }
+   },
+   "id": "transition-normalized",
+   "name": "Transition received to normalized",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    1680,
+    50
+   ],
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "SELECT public.pgmq_send_order(\n  'q_orders_push_ls',\n  jsonb_build_object(\n    'canonical_id', (SELECT id FROM public.canonical_orders WHERE source='shopify'::public.order_source AND external_ref=$1 LIMIT 1)::text,\n    'source',       'shopify',\n    'external_ref', $1::text,\n    'location_key', $2::text\n  )\n) AS msg_id",
+    "options": {
+     "queryReplacement": "={{ $('Normalize Shopify to Canonical').item.json.canonical.external_ref }},={{ $('Normalize Shopify to Canonical').item.json.canonical.location_key }}"
+    }
+   },
+   "id": "enqueue-ls",
+   "name": "pgmq.send q_orders_push_ls",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    1880,
+    50
+   ],
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "parameters": {
+    "jsCode": "return [{ json: { ok: true, canonical_external_ref: $('Normalize Shopify to Canonical').item.json.canonical.external_ref, location_key: $('Normalize Shopify to Canonical').item.json.canonical.location_key } }];\n"
+   },
+   "id": "respond-ok",
+   "name": "Return ok",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2500,
+    50
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "return $input.all();\n"
+   },
+   "id": "respond-fail",
+   "name": "Return fail",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1080,
+    460
+   ]
+  },
+  {
+   "id": "check-loc-active-norm",
+   "name": "Check Location Active",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    1080,
+    100
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "SELECT COALESCE(is_active, true) AS location_active FROM public.dim_location WHERE location_key = $1",
+    "options": {
+     "queryReplacement": "={{ $json.canonical.location_key }}"
+    }
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "if-loc-active-norm",
+   "name": "IF Location Active?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    1280,
+    100
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "leftValue": "={{ $json.location_active }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       },
+       "id": "condition-1781682587155-lnwlt9hyp"
+      }
+     ]
+    },
+    "options": {}
+   }
+  }
+ ],
+ "connections": {
+  "When Called by Another Workflow": {
+   "main": [
+    [
+     {
+      "node": "Load raw_orders row",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load raw_orders row": {
+   "main": [
+    [
+     {
+      "node": "Normalize Shopify to Canonical",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Normalize Shopify to Canonical": {
+   "main": [
+    [
+     {
+      "node": "Normalize OK?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Normalize OK?": {
+   "main": [
+    [
+     {
+      "node": "Check Location Active",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Return fail",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "INSERT canonical_orders": {
+   "main": [
+    [
+     {
+      "node": "Transition received to normalized",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Transition received to normalized": {
+   "main": [
+    [
+     {
+      "node": "pgmq.send q_orders_push_ls",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Check Location Active": {
+   "main": [
+    [
+     {
+      "node": "IF Location Active?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF Location Active?": {
+   "main": [
+    [
+     {
+      "node": "INSERT canonical_orders",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Return ok",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "pgmq.send q_orders_push_ls": {
+   "main": [
+    [
+     {
+      "node": "Return ok",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "callerPolicy": "workflowsFromSameOwner",
+  "availableInMCP": false
+ },
+ "_meta": {
+  "n8n_id": "OdYCsotEru63kxN7",
+  "snapshot": "2026-08-04",
+  "note": "post-remediation snapshot (audit 2026-08-04)"
+ }
+}

@@ -1,0 +1,492 @@
+{
+ "name": "resolve_and_push_takeaway_order",
+ "nodes": [
+  {
+   "id": "trigger-input",
+   "name": "When called",
+   "type": "n8n-nodes-base.executeWorkflowTrigger",
+   "typeVersion": 1.1,
+   "position": [
+    0,
+    200
+   ],
+   "parameters": {
+    "inputSource": "passthrough"
+   }
+  },
+  {
+   "id": "fetch-detail",
+   "name": "Fetch Order Detail",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    220,
+    200
+   ],
+   "parameters": {
+    "method": "GET",
+    "url": "=https://live-orders-api.takeaway.com/api/orders/{{ $json.detail_id }}",
+    "sendHeaders": true,
+    "specifyHeaders": "keypair",
+    "headerParameters": {
+     "parameters": [
+      {
+       "name": "Authorization",
+       "value": "=Bearer {{ $json.access_token }}"
+      },
+      {
+       "name": "Accept",
+       "value": "application/json"
+      }
+     ]
+    },
+    "options": {
+     "timeout": 15000
+    }
+   }
+  },
+  {
+   "id": "pin-context",
+   "name": "Pin Context",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    440,
+    200
+   ],
+   "parameters": {
+    "jsCode": "const detail = $input.first().json;\nconst input = $('When called').first().json;\nconst product_names_lower = Array.from(new Set((detail.products || []).map(p => (p.name || '').toLowerCase()).filter(Boolean)));\nreturn [{ json: {\n  detail,\n  location_key: input.location_key,\n  access_token: input.access_token,\n  product_names_lower\n}}];"
+   }
+  },
+  {
+   "id": "load-targeted-catalog",
+   "name": "Load Targeted Catalog",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    660,
+    120
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "SELECT LOWER(name) AS name_lower, sku FROM public.raw_ls_products WHERE location_key = '{{ $json.location_key }}' AND visible = true AND sku IS NOT NULL AND sku <> '' AND LOWER(name) = ANY(ARRAY[{{ $json.product_names_lower.map(n => \"'\" + n.replace(/'/g, \"''\") + \"'\").join(',') || \"''\" }}]::text[]);",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "load-targeted-plu-map",
+   "name": "Load Targeted PLU Map",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    660,
+    280
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "SELECT takeaway_name_lower, ls_plu FROM public.takeaway_plu_map WHERE location_key = '{{ $('Pin Context').first().json.location_key }}' AND ls_plu IS NOT NULL AND takeaway_name_lower = ANY(ARRAY[{{ $('Pin Context').first().json.product_names_lower.map(n => \"'\" + n.replace(/'/g, \"''\") + \"'\").join(',') || \"''\" }}]::text[]);",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "merge-lookups",
+   "name": "Merge Lookups",
+   "type": "n8n-nodes-base.merge",
+   "typeVersion": 3.2,
+   "position": [
+    880,
+    200
+   ],
+   "parameters": {
+    "mode": "combine",
+    "combineBy": "combineAll",
+    "options": {}
+   }
+  },
+  {
+   "id": "normalize",
+   "name": "Normalize Order",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1100,
+    200
+   ],
+   "parameters": {
+    "jsCode": "const detail = $('Pin Context').first().json.detail;\nconst location_key = $('Pin Context').first().json.location_key;\nconst pluMapRows = $('Load Targeted PLU Map').all();\nconst lsCatalogRows = $('Load Targeted Catalog').all();\n\nconst pluByName = {};\nfor (const r of pluMapRows) { if (r.json.takeaway_name_lower) pluByName[r.json.takeaway_name_lower] = r.json.ls_plu; }\n\nconst lsCatalogByName = {};\nfor (const r of lsCatalogRows) {\n  const lower = r.json.name_lower; if (!lower) continue;\n  if (!lsCatalogByName[lower]) lsCatalogByName[lower] = [];\n  lsCatalogByName[lower].push(r.json.sku);\n}\n\nfunction resolvePlu(productName) {\n  const nameLower = (productName || '').toLowerCase();\n  if (pluByName[nameLower]) return pluByName[nameLower];\n  const matches = lsCatalogByName[nameLower] || [];\n  if (matches.length === 1) return matches[0];\n  if (matches.length > 1) return 'AMBIGUOUS:' + (productName || 'unknown').slice(0, 80);\n  return 'UNMAPPED:' + (productName || 'unknown').slice(0, 80);\n}\n\nfunction mapPayment(pt) {\n  const map = {'online':{method:'card_online',status:'paid'},'creditcard':{method:'card_online',status:'paid'},'visa':{method:'card_online',status:'paid'},'mastercard':{method:'card_online',status:'paid'},'takeawayPay':{method:'card_online',status:'paid'},'jetpay':{method:'card_online',status:'paid'},'cash':{method:'cash',status:'pending'},'pinAtHome':{method:'bancontact',status:'pending'},'home_debitcard':{method:'bancontact',status:'pending'},'home_creditcard':{method:'card_online',status:'pending'},'mealVoucher':{method:'voucher',status:'pending'},'meal_voucher':{method:'voucher',status:'paid'},'voucher':{method:'voucher',status:'paid'},'giftCard':{method:'voucher',status:'paid'},'cheque':{method:'other',status:'pending'},'accountcredit':{method:'other',status:'paid'},'debitcard':{method:'bancontact',status:'paid'}};\n  return map[pt] || { method:'card_online', status:'paid' };\n}\nfunction euroToCents(n){return Math.round(Number(n||0)*100);}\n\nconst products = detail.products || [];\nconst items = products.map(p => {\n  const modifiers = (p.specifications||[]).map(s => ({plu:'', name:s.name||'', unit_price_cents:euroToCents(s.amount)}));\n  const item = { plu: resolvePlu(p.name), name: p.name, qty: p.quantity||1, unit_price_cents: euroToCents(p.amount), modifiers };\n  if (p.remarks) item.notes = String(p.remarks);\n  return item;\n});\n\nconst c = detail.customer || {};\nconst isDelivery = detail.delivery_type === 'delivery';\n// JET extras: c.extra = [\"Floor: 001\", ...] (bus/verdiep) -> line2; c.company_name is\n// free text customers use for delivery instructions or names -> keep in notes.\nconst line1Norm = [c.street, c.street_number].filter(Boolean).join(' ').toLowerCase().replace(/\\s+/g, '');\nconst extraParts = (Array.isArray(c.extra) ? c.extra : [])\n  .map(v => String(v).trim()).filter(Boolean)\n  .filter(v => !line1Norm.includes(v.toLowerCase().replace(/\\s+/g, ''))); // skip if already in line1\nconst extraLine = extraParts.length ? extraParts.join(', ') : null;\nconst addr = isDelivery ? { line1:[c.street,c.street_number].filter(Boolean).join(' '), line2: extraLine, postal_code:c.postcode||'', city:c.city||'', country:'BE', lat:null, lng:null } : null;\nconst notesParts = [detail.remarks, c.company_name].map(v => (v == null ? '' : String(v).trim())).filter(Boolean);\nconst customer = { name: c.full_name || 'Takeaway Customer', email: null, phone: c.phone_number || null, address: addr, notes: notesParts.length ? notesParts.join(' | ') : null };\n\nconst pay = mapPayment(detail.payment_type);\nconst totalCents = euroToCents(detail.customer_total != null ? detail.customer_total : detail.restaurant_total);\nconst baseCents = Math.round(totalCents / 1.12);\nconst vatCents = totalCents - baseCents;\nconst vat_lines = [{ rate_bp:1200, base_cents:baseCents, vat_cents:vatCents }];\n\nconst external_ref = 'Takeaway - ' + detail.public_reference;\nconst canonical = { schema_version:'1.1', source:'takeaway', external_ref, location_key, order_type: isDelivery?'delivery':'pickup', status:'received', customer, items, payment:{method:pay.method,status:pay.status,total_cents:totalCents,currency:detail.currency||'EUR'}, vat_lines };\nconst product_names = Array.from(new Set(products.map(p => p.name).filter(Boolean)));\n\nreturn [{ json: { detail_id: detail.id, external_ref, location_key, is_delivery: isDelivery, order_type: canonical.order_type, canonical, raw_payload: detail, product_names } }];"
+   }
+  },
+  {
+   "id": "insert-raw",
+   "name": "Insert raw_orders",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    1320,
+    200
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "INSERT INTO public.raw_orders (source, location_key, shopify_order_id, external_ref, raw_payload, hmac_valid, received_at)\nVALUES ('takeaway'::public.order_source, $1::text, $2::bigint, $3::text, $4::jsonb, true, NOW())\n ON CONFLICT (shopify_order_id, location_key) DO UPDATE SET raw_payload = EXCLUDED.raw_payload, received_at = EXCLUDED.received_at RETURNING id;",
+    "options": {
+     "queryReplacement": "={{ $json.location_key }},={{ $json.detail_id }},={{ $json.external_ref }},={{ JSON.stringify($json.raw_payload) }}"
+    }
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "accept-ta",
+   "name": "Accept Takeaway Order",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    1540,
+    200
+   ],
+   "parameters": {
+    "method": "PATCH",
+    "url": "=https://live-orders-api.takeaway.com/api/orders/{{ $('Normalize Order').item.json.detail_id }}",
+    "sendHeaders": true,
+    "specifyHeaders": "keypair",
+    "headerParameters": {
+     "parameters": [
+      {
+       "name": "Authorization",
+       "value": "=Bearer {{ $('When called').first().json.access_token }}"
+      },
+      {
+       "name": "Content-Type",
+       "value": "application/json"
+      },
+      {
+       "name": "Accept",
+       "value": "application/json"
+      }
+     ]
+    },
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={\"status\":\"in_delivery\"}",
+    "options": {
+     "timeout": 10000
+    }
+   },
+   "continueOnFail": true
+  },
+  {
+   "id": "check-loc-active",
+   "name": "Check Location Active",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    1760,
+    200
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "SELECT COALESCE(is_active, true) AS location_active FROM public.dim_location WHERE location_key = '{{ $('When called').first().json.location_key }}'",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "if-loc-active",
+   "name": "IF Location Active?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    1980,
+    200
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "cond-loc-active",
+       "leftValue": "={{ $json.location_active }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ]
+    },
+    "options": {}
+   }
+  },
+  {
+   "id": "upsert-canonical",
+   "name": "Upsert canonical_orders",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    2200,
+    120
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "INSERT INTO public.canonical_orders (\n  schema_version, source, external_ref, location_key, order_type, status,\n  customer, items, payment, vat_lines, raw_payload_id\n) VALUES (\n  '1.1', 'takeaway'::public.order_source, $1, $2, $3::public.order_channel_type,\n  'received'::public.order_state,\n  $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::bigint\n)\nON CONFLICT (source, external_ref) DO UPDATE SET\n  items = EXCLUDED.items,\n  payment = EXCLUDED.payment,\n  vat_lines = EXCLUDED.vat_lines,\n  customer = EXCLUDED.customer,\n  order_type = EXCLUDED.order_type,\n  updated_at = now()\nWHERE canonical_orders.location_key = EXCLUDED.location_key\nRETURNING id, (xmax = 0) AS was_inserted, status;",
+    "options": {
+     "queryReplacement": "={{ $('Normalize Order').item.json.external_ref }},={{ $('Normalize Order').item.json.location_key }},={{ $('Normalize Order').item.json.order_type }},={{ JSON.stringify($('Normalize Order').item.json.canonical.customer) }},={{ JSON.stringify($('Normalize Order').item.json.canonical.items) }},={{ JSON.stringify($('Normalize Order').item.json.canonical.payment) }},={{ JSON.stringify($('Normalize Order').item.json.canonical.vat_lines) }},={{ $('Insert raw_orders').item.json.id }}"
+    }
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "transition-enqueue",
+   "name": "Transition + Enqueue + PLU Map",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.6,
+   "position": [
+    2420,
+    120
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "WITH transition AS (\n  UPDATE public.canonical_orders SET status = 'normalized'::public.order_state\n  WHERE id = $1::uuid AND status = 'received'::public.order_state RETURNING id\n),\nenqueues AS (\n  SELECT\n    CASE WHEN $4::boolean THEN public.pgmq_send_order('q_orders_push_ls', jsonb_build_object('canonical_id',$1::text,'source','takeaway','external_ref',$2::text,'location_key',$3::text)) END AS ls_msg_id,\n    CASE WHEN $4::boolean AND $5::text = 'delivery' THEN public.pgmq_send_order('q_orders_push_shipday', jsonb_build_object('canonical_id',$1::text,'source','takeaway','external_ref',$2::text,'location_key',$3::text)) END AS shipday_msg_id\n),\nplu_map_lookup AS (\n  SELECT DISTINCT name,\n    (SELECT l.sku FROM public.raw_ls_products l WHERE l.location_key=$3::text AND LOWER(l.name)=LOWER(name) AND l.visible=true AND l.sku IS NOT NULL LIMIT 1) AS candidate_sku,\n    (SELECT l.name FROM public.raw_ls_products l WHERE l.location_key=$3::text AND LOWER(l.name)=LOWER(name) AND l.visible=true AND l.sku IS NOT NULL LIMIT 1) AS candidate_name,\n    (SELECT COUNT(*) FROM public.raw_ls_products l WHERE l.location_key=$3::text AND LOWER(l.name)=LOWER(name) AND l.visible=true AND l.sku IS NOT NULL) AS match_count\n  FROM jsonb_array_elements_text($6::jsonb) AS name\n),\nplu_map AS (\n  INSERT INTO public.takeaway_plu_map (location_key, takeaway_name, ls_plu, ls_product_name, auto_matched, last_seen_at, order_count)\n  SELECT $3::text, pml.name,\n    CASE WHEN pml.match_count=1 THEN pml.candidate_sku ELSE NULL END,\n    CASE WHEN pml.match_count=1 THEN pml.candidate_name ELSE NULL END,\n    pml.match_count=1, NOW(), 1\n  FROM plu_map_lookup pml\n  ON CONFLICT (location_key, takeaway_name) DO UPDATE SET\n    last_seen_at=NOW(),\n    order_count=public.takeaway_plu_map.order_count+1,\n    ls_plu=COALESCE(public.takeaway_plu_map.ls_plu, EXCLUDED.ls_plu),\n    ls_product_name=COALESCE(public.takeaway_plu_map.ls_product_name, EXCLUDED.ls_product_name),\n    auto_matched=public.takeaway_plu_map.auto_matched OR EXCLUDED.auto_matched\n  RETURNING 1\n)\nSELECT (SELECT id FROM transition) AS transitioned_id,\n  (SELECT ls_msg_id FROM enqueues) AS ls_msg_id,\n  (SELECT shipday_msg_id FROM enqueues) AS shipday_msg_id,\n  (SELECT count(*) FROM plu_map) AS plu_upserts;",
+    "options": {
+     "queryReplacement": "={{ $('Upsert canonical_orders').first().json.id }},={{ $('Normalize Order').item.json.external_ref }},={{ $('Normalize Order').item.json.location_key }},={{ $('Upsert canonical_orders').first().json.was_inserted }},={{ $('Normalize Order').item.json.order_type }},={{ JSON.stringify($('Normalize Order').item.json.product_names) }}"
+    }
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "summarize",
+   "name": "Return Summary",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2640,
+    120
+   ],
+   "parameters": {
+    "jsCode": "const norm = $('Normalize Order').first().json;\nconst items = norm.canonical.items || [];\nconst unmapped = items.filter(i => String(i.plu||'').startsWith('UNMAPPED:') || String(i.plu||'').startsWith('AMBIGUOUS:')).length;\nreturn [{ json: { external_ref: norm.external_ref, status: 'ok', ls_plu_unmapped_count: unmapped }}];"
+   }
+  },
+  {
+   "id": "skipped-summary",
+   "name": "Return Skipped",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2200,
+    280
+   ],
+   "parameters": {
+    "jsCode": "const norm = $('Normalize Order').first().json;\nreturn [{ json: { external_ref: norm.external_ref, status: 'skipped_location_inactive', ls_plu_unmapped_count: 0 }}];"
+   }
+  }
+ ],
+ "connections": {
+  "When called": {
+   "main": [
+    [
+     {
+      "node": "Fetch Order Detail",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Fetch Order Detail": {
+   "main": [
+    [
+     {
+      "node": "Pin Context",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Pin Context": {
+   "main": [
+    [
+     {
+      "node": "Load Targeted Catalog",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "Load Targeted PLU Map",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load Targeted Catalog": {
+   "main": [
+    [
+     {
+      "node": "Merge Lookups",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load Targeted PLU Map": {
+   "main": [
+    [
+     {
+      "node": "Merge Lookups",
+      "type": "main",
+      "index": 1
+     }
+    ]
+   ]
+  },
+  "Merge Lookups": {
+   "main": [
+    [
+     {
+      "node": "Normalize Order",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Normalize Order": {
+   "main": [
+    [
+     {
+      "node": "Insert raw_orders",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Insert raw_orders": {
+   "main": [
+    [
+     {
+      "node": "Accept Takeaway Order",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Check Location Active": {
+   "main": [
+    [
+     {
+      "node": "IF Location Active?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF Location Active?": {
+   "main": [
+    [
+     {
+      "node": "Transition + Enqueue + PLU Map",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Return Skipped",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Transition + Enqueue + PLU Map": {
+   "main": [
+    [
+     {
+      "node": "Return Summary",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Accept Takeaway Order": {
+   "main": [
+    [
+     {
+      "node": "Upsert canonical_orders",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Upsert canonical_orders": {
+   "main": [
+    [
+     {
+      "node": "Check Location Active",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "saveManualExecutions": true,
+  "saveExecutionProgress": true,
+  "saveDataErrorExecution": "all",
+  "saveDataSuccessExecution": "all",
+  "callerPolicy": "workflowsFromSameOwner",
+  "availableInMCP": false
+ },
+ "_meta": {
+  "n8n_id": "XNeJaLEPB6uB94Ra",
+  "snapshot": "2026-08-04",
+  "note": "post-remediation snapshot (audit 2026-08-04)"
+ }
+}

@@ -1,0 +1,883 @@
+{
+ "name": "push_shipday_order",
+ "nodes": [
+  {
+   "id": "trig-manual",
+   "name": "Manual Trigger",
+   "type": "n8n-nodes-base.manualTrigger",
+   "typeVersion": 1,
+   "position": [
+    0,
+    0
+   ],
+   "parameters": {}
+  },
+  {
+   "id": "trig-sched",
+   "name": "Schedule (10s)",
+   "type": "n8n-nodes-base.scheduleTrigger",
+   "typeVersion": 1.2,
+   "position": [
+    0,
+    200
+   ],
+   "parameters": {
+    "rule": {
+     "interval": [
+      {
+       "field": "seconds",
+       "secondsInterval": 10
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "pgmq-read",
+   "name": "Read q_orders_push_shipday",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    250,
+    100
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "SELECT msg_id, message FROM pgmq_read_order('q_orders_push_shipday', 60, 1);",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "parse-msg",
+   "name": "Parse Messages",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    500,
+    100
+   ],
+   "parameters": {
+    "jsCode": "const items = $input.all();\nif (!items.length || !items[0].json.msg_id) return [];\nreturn items.map(i => {\n  const msg = typeof i.json.message === 'string' ? JSON.parse(i.json.message) : i.json.message;\n  return { json: { ...i.json, ...msg } };\n});"
+   }
+  },
+  {
+   "id": "load-canonical",
+   "name": "Load Canonical Order",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    750,
+    100
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=SELECT co.id, co.source, co.external_ref, co.location_key, co.order_type, co.status, co.customer, co.items, co.payment, co.correlation_id, co.shipday_order_id, COALESCE(dl.is_active, true) AS location_active, COALESCE(dl.deliverect_active, false) AS deliverect_active, dl.name AS restaurant_name, dl.restaurant_address, dl.restaurant_phone, dl.gps_lat, dl.gps_lng, ro.raw_payload->>'restaurant_estimated_delivery_time' AS raw_est_delivery, ro.raw_payload->>'restaurant_estimated_pickup_time' AS raw_est_pickup FROM canonical_orders co LEFT JOIN dim_location dl ON dl.location_key = co.location_key LEFT JOIN raw_orders ro ON ro.id = co.raw_payload_id WHERE co.id = '{{ $json.canonical_id }}'::uuid;",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "gate-active",
+   "name": "Gate: Location Active?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    900,
+    100
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "loose"
+     },
+     "conditions": [
+      {
+       "id": "c1",
+       "leftValue": "={{ $json.location_active }}",
+       "rightValue": "",
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   }
+  },
+  {
+   "id": "log-skip",
+   "name": "Log Location Skip",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    1050,
+    300
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=INSERT INTO public.order_state_history (canonical_order_id, from_state, to_state, reason, correlation_id) VALUES ('{{ $('Load Canonical Order').item.json.id }}'::uuid, '{{ $('Load Canonical Order').item.json.status }}'::order_state, '{{ $('Load Canonical Order').item.json.status }}'::order_state, 'location_paused', NULLIF('{{ $('Load Canonical Order').item.json.correlation_id }}', '')::uuid);",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "ack-skip",
+   "name": "Ack Skipped Msg",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    1200,
+    300
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=SELECT public.pgmq_delete_order('q_orders_push_shipday', {{ $('Parse Messages').item.json.msg_id }});",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "load-key",
+   "name": "Load Shipday Key",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    1200,
+    100
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=SELECT decrypted_secret AS shipday_api_key FROM vault.decrypted_secrets WHERE name = 'shipday_api_key_' || '{{ $('Load Canonical Order').item.json.location_key }}' LIMIT 1;",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "check-existing",
+   "name": "Check Shipday Existing",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    1350,
+    100
+   ],
+   "parameters": {
+    "method": "GET",
+    "url": "=https://api.shipday.com/orders/{{ $('Load Canonical Order').item.json.external_ref }}",
+    "sendHeaders": true,
+    "headerParameters": {
+     "parameters": [
+      {
+       "name": "Authorization",
+       "value": "=Basic {{ $('Load Shipday Key').item.json.shipday_api_key }}"
+      },
+      {
+       "name": "Accept",
+       "value": "application/json"
+      }
+     ]
+    },
+    "options": {
+     "response": {
+      "response": {
+       "fullResponse": true,
+       "responseFormat": "json"
+      }
+     },
+     "timeout": 10000
+    }
+   },
+   "onError": "continueRegularOutput"
+  },
+  {
+   "id": "filter-idem",
+   "name": "Filter Shipday Idempotency",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1500,
+    100
+   ],
+   "parameters": {
+    "jsCode": "const resp = $input.first().json;\nconst canonical = $('Load Canonical Order').item.json;\nconst parse = $('Parse Messages').item.json;\nconst key = $('Load Shipday Key').item.json.shipday_api_key;\nconst statusCode = resp.statusCode || resp.status || 0;\nconst body = resp.body ?? resp.data ?? resp;\nlet idempotency_skip = false;\nlet existing_shipday_order_id = null;\nif (statusCode === 200 && body) {\n  if (Array.isArray(body) && body.length && body[0].orderId) {\n    idempotency_skip = true;\n    existing_shipday_order_id = String(body[0].orderId);\n  } else if (body.orderId) {\n    idempotency_skip = true;\n    existing_shipday_order_id = String(body.orderId);\n  }\n}\nreturn [{ json: {\n  idempotency_skip,\n  existing_shipday_order_id,\n  canonical_id: canonical.id,\n  external_ref: canonical.external_ref,\n  location_key: canonical.location_key,\n  correlation_id: canonical.correlation_id,\n  msg_id: parse.msg_id,\n  shipday_api_key: key,\n  customer: canonical.customer,\n  items: canonical.items,\n  payment: canonical.payment,\n  restaurant_name: canonical.restaurant_name,\n  restaurant_address: canonical.restaurant_address,\n  restaurant_phone: canonical.restaurant_phone,\n  gps_lat: canonical.gps_lat,\n  gps_lng: canonical.gps_lng\n}}];"
+   }
+  },
+  {
+   "id": "if-idem",
+   "name": "IF Idempotency Skip",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    1650,
+    100
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "loose"
+     },
+     "conditions": [
+      {
+       "id": "c1",
+       "leftValue": "={{ $json.idempotency_skip }}",
+       "rightValue": "",
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   }
+  },
+  {
+   "id": "adopt-existing",
+   "name": "Adopt Existing Shipday Order",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    1800,
+    0
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=UPDATE canonical_orders SET shipday_order_id = '{{ $json.existing_shipday_order_id }}', shipday_pushed_at = now() WHERE id = '{{ $json.canonical_id }}'::uuid; SELECT pgmq_delete_order('q_orders_push_shipday', {{ $json.msg_id }});",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "build-payload",
+   "name": "Build Shipday Payload",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1800,
+    200
+   ],
+   "parameters": {
+    "jsCode": "const inp = $input.first().json;\nconst customer = inp.customer || {};\nconst addr = customer.address || {};\nconst payment = inp.payment || {};\nconst items = inp.items || [];\nconst pad = n => String(n).padStart(2, '0');\n// Shipday expects UTC: date yyyy-mm-dd, times hh:mm:ss (see SHIPDAY-API-REFERENCE.md)\nconst fmtTime = d => `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;\nconst fmtDate = d => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;\nconst now = new Date();\n\n// Promised times from JET (restaurant_estimated_*) instead of hardcoded now+20/+45 \u2014\n// pre-orders used to hit the dispatch board hours early with a bogus ETA.\nfunction parseFuture(iso, minAheadMs) {\n  if (!iso) return null;\n  const t = new Date(iso);\n  return (!isNaN(t.getTime()) && t.getTime() > now.getTime() + minAheadMs) ? t : null;\n}\nconst promisedDelivery = parseFuture(inp.raw_est_delivery, 5 * 60 * 1000) || new Date(now.getTime() + 45 * 60 * 1000);\nconst promisedPickup = parseFuture(inp.raw_est_pickup, 0)\n  || new Date(Math.max(promisedDelivery.getTime() - 25 * 60 * 1000, now.getTime() + 10 * 60 * 1000));\n\n// Address: house number lives inside line1 (JET) or line2 (Shopify) \u2014 join street parts\n// with spaces, then locality. Country code \u2192 full name for geocoding.\nconst COUNTRY = { BE: 'Belgium', NL: 'Netherlands', FR: 'France', DE: 'Germany' };\nconst street = [addr.line1, addr.line2].filter(Boolean).join(' ').trim();\nconst locality = [addr.postal_code, addr.city].filter(Boolean).join(' ').trim();\nconst customerAddress = [street, locality, COUNTRY[addr.country] || addr.country].filter(Boolean).join(', ');\n\nconst totalCents = payment.total_cents || 0;\nconst paymentMethod = (payment.method === 'cash') ? 'cash' : 'credit_card';\nconst orderItem = items.map(it => ({\n  name: it.name || it.title || 'Item',\n  quantity: it.qty || it.quantity || 1,\n  unitPrice: ((it.unit_price_cents || 0) / 100),\n  detail: it.notes || ''\n}));\nconst payload = {\n  orderNumber: inp.external_ref,\n  customerName: customer.name || 'Customer',\n  customerAddress: customerAddress || 'Unknown',\n  customerPhoneNumber: customer.phone || '',\n  customerEmail: customer.email || '',\n  restaurantName: inp.restaurant_name,\n  restaurantAddress: inp.restaurant_address,\n  restaurantPhoneNumber: inp.restaurant_phone || '',\n  expectedDeliveryDate: fmtDate(promisedDelivery),\n  expectedPickupTime: fmtTime(promisedPickup),\n  expectedDeliveryTime: fmtTime(promisedDelivery),\n  pickupLatitude: inp.gps_lat,\n  pickupLongitude: inp.gps_lng,\n  totalOrderCost: totalCents / 100,\n  paymentMethod,\n  deliveryInstruction: customer.notes || '',\n  orderSource: 'Srova Data',\n  additionalId: inp.canonical_id,\n  orderItem\n};\n// Precise dropoff coords when the source provided them \u2014 stops Shipday geocoding guesses.\nif (addr.lat != null && addr.lng != null) {\n  payload.deliveryLatitude = addr.lat;\n  payload.deliveryLongitude = addr.lng;\n}\nreturn [{ json: {\n  payload,\n  canonical_id: inp.canonical_id,\n  external_ref: inp.external_ref,\n  location_key: inp.location_key,\n  correlation_id: inp.correlation_id,\n  msg_id: inp.msg_id,\n  shipday_api_key: inp.shipday_api_key\n}}];"
+   }
+  },
+  {
+   "id": "post-orders",
+   "name": "POST /orders",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    1950,
+    200
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "https://api.shipday.com/orders",
+    "sendHeaders": true,
+    "headerParameters": {
+     "parameters": [
+      {
+       "name": "Authorization",
+       "value": "=Basic {{ $json.shipday_api_key }}"
+      },
+      {
+       "name": "Content-Type",
+       "value": "application/json"
+      },
+      {
+       "name": "Accept",
+       "value": "application/json"
+      }
+     ]
+    },
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify($json.payload) }}",
+    "options": {
+     "response": {
+      "response": {
+       "fullResponse": true,
+       "responseFormat": "json"
+      }
+     },
+     "timeout": 15000
+    }
+   },
+   "onError": "continueRegularOutput"
+  },
+  {
+   "id": "classify",
+   "name": "Classify Shipday Response",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2100,
+    200
+   ],
+   "parameters": {
+    "jsCode": "const resp = $input.first().json;\nconst input = $('Build Shipday Payload').item.json;\nconst statusCode = resp.statusCode || resp.status || resp.error?.status || 0;\nconst body = resp.body ?? resp.data ?? resp;\nlet action, alert = false, validationError = null;\nlet shipday_order_id = null;\nif (statusCode === 200 || statusCode === 201) {\n  action = 'success';\n  if (body && body.orderId) shipday_order_id = String(body.orderId);\n} else if (statusCode === 401) {\n  action = 'retry';\n} else if (statusCode === 400) {\n  action = 'dlq';\n  alert = true;\n  validationError = resp.error?.message || body;\n} else if (statusCode === 403) {\n  action = 'dlq';\n  alert = true;\n} else if (statusCode >= 500 || statusCode === 429 || statusCode === 0) {\n  action = 'retry';\n} else {\n  action = 'dlq';\n  alert = true;\n}\nreturn [{ json: {\n  action,\n  alert,\n  validationError,\n  shipday_order_id,\n  statusCode,\n  canonical_id: input.canonical_id,\n  external_ref: input.external_ref,\n  location_key: input.location_key,\n  correlation_id: input.correlation_id,\n  msg_id: input.msg_id\n}}];"
+   }
+  },
+  {
+   "id": "if-success",
+   "name": "IF Success",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    2150,
+    100
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "loose"
+     },
+     "conditions": [
+      {
+       "id": "c1",
+       "leftValue": "={{ $json.action }}",
+       "rightValue": "success",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   }
+  },
+  {
+   "id": "if-retry",
+   "name": "IF Retry",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    2150,
+    300
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "loose"
+     },
+     "conditions": [
+      {
+       "id": "c1",
+       "leftValue": "={{ $json.action }}",
+       "rightValue": "retry",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   }
+  },
+  {
+   "id": "if-dlq",
+   "name": "IF DLQ",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    2150,
+    500
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "loose"
+     },
+     "conditions": [
+      {
+       "id": "c1",
+       "leftValue": "={{ $json.action }}",
+       "rightValue": "dlq",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   }
+  },
+  {
+   "id": "succ-update",
+   "name": "Success: Update Shipday Id",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    2300,
+    100
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=UPDATE canonical_orders SET shipday_order_id = '{{ $json.shipday_order_id }}', shipday_pushed_at = now() WHERE id = '{{ $json.canonical_id }}'::uuid; SELECT pgmq_delete_order('q_orders_push_shipday', {{ $json.msg_id }});",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "retry-vt",
+   "name": "Retry: Set VT 60s",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    2300,
+    300
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=SELECT pgmq_set_vt_order('q_orders_push_shipday', {{ $json.msg_id }}, 60);",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "dlq-arch",
+   "name": "DLQ: Archive Shipday",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    2300,
+    500
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=SELECT pgmq_archive_order('q_orders_push_shipday', {{ $json.msg_id }}); INSERT INTO dlq_alerts (queue_name, msg_id, external_ref, source, location_key, canonical_order_id, last_error, attempt_count, alerted_at, created_at) VALUES ('q_orders_push_shipday', {{ $json.msg_id }}, '{{ $json.external_ref }}', 'shipday', '{{ $json.location_key }}', '{{ $json.canonical_id }}'::uuid, jsonb_build_object('message', 'Shipday push failed', 'code', '12401', 'stage', 'push_shipday'), 1, now(), now());",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  },
+  {
+   "id": "if-source-takeaway",
+   "name": "IF Source Takeaway?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    1050,
+    100
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "leftValue": "={{ $json.source }}",
+       "rightValue": "takeaway",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       },
+       "id": "condition-1781691286676-d3knvrem4"
+      }
+     ]
+    },
+    "options": {}
+   }
+  },
+  {
+   "id": "if-deliverect-yield-shipday",
+   "name": "IF NOT Deliverect Active?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2.2,
+   "position": [
+    1180,
+    100
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "leftValue": "={{ $json.deliverect_active }}",
+       "rightValue": false,
+       "operator": {
+        "type": "boolean",
+        "operation": "false",
+        "singleValue": true
+       },
+       "id": "condition-1781695430866-dssqdas7l"
+      }
+     ]
+    },
+    "options": {}
+   }
+  },
+  {
+   "id": "log-deliverect-yield-shipday",
+   "name": "Log Deliverect Yield (Shipday)",
+   "type": "n8n-nodes-base.postgres",
+   "typeVersion": 2.5,
+   "position": [
+    1300,
+    450
+   ],
+   "parameters": {
+    "operation": "executeQuery",
+    "query": "=INSERT INTO public.order_state_history (canonical_order_id, from_state, to_state, reason, correlation_id) VALUES ('{{ $('Load Canonical Order').item.json.id }}'::uuid, '{{ $('Load Canonical Order').item.json.status }}'::order_state, '{{ $('Load Canonical Order').item.json.status }}'::order_state, 'deliverect_yield', NULLIF('{{ $('Load Canonical Order').item.json.correlation_id }}', '')::uuid);",
+    "options": {}
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   }
+  }
+ ],
+ "connections": {
+  "Manual Trigger": {
+   "main": [
+    [
+     {
+      "node": "Read q_orders_push_shipday",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Schedule (10s)": {
+   "main": [
+    [
+     {
+      "node": "Read q_orders_push_shipday",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Read q_orders_push_shipday": {
+   "main": [
+    [
+     {
+      "node": "Parse Messages",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse Messages": {
+   "main": [
+    [
+     {
+      "node": "Load Canonical Order",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load Canonical Order": {
+   "main": [
+    [
+     {
+      "node": "Gate: Location Active?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Gate: Location Active?": {
+   "main": [
+    [
+     {
+      "node": "IF Source Takeaway?",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Log Location Skip",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Log Location Skip": {
+   "main": [
+    [
+     {
+      "node": "Ack Skipped Msg",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load Shipday Key": {
+   "main": [
+    [
+     {
+      "node": "Check Shipday Existing",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Check Shipday Existing": {
+   "main": [
+    [
+     {
+      "node": "Filter Shipday Idempotency",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Filter Shipday Idempotency": {
+   "main": [
+    [
+     {
+      "node": "IF Idempotency Skip",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF Idempotency Skip": {
+   "main": [
+    [
+     {
+      "node": "Adopt Existing Shipday Order",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Build Shipday Payload",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build Shipday Payload": {
+   "main": [
+    [
+     {
+      "node": "POST /orders",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "POST /orders": {
+   "main": [
+    [
+     {
+      "node": "Classify Shipday Response",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Classify Shipday Response": {
+   "main": [
+    [
+     {
+      "node": "IF Success",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "IF Retry",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "IF DLQ",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF Success": {
+   "main": [
+    [
+     {
+      "node": "Success: Update Shipday Id",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF Retry": {
+   "main": [
+    [
+     {
+      "node": "Retry: Set VT 60s",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF DLQ": {
+   "main": [
+    [
+     {
+      "node": "DLQ: Archive Shipday",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF Source Takeaway?": {
+   "main": [
+    [
+     {
+      "node": "IF NOT Deliverect Active?",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Ack Skipped Msg",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF NOT Deliverect Active?": {
+   "main": [
+    [
+     {
+      "node": "Load Shipday Key",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Log Deliverect Yield (Shipday)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Log Deliverect Yield (Shipday)": {
+   "main": [
+    [
+     {
+      "node": "Ack Skipped Msg",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "callerPolicy": "workflowsFromSameOwner",
+  "availableInMCP": false
+ },
+ "_meta": {
+  "n8n_id": "C3SfhvbDjYPZinKm",
+  "snapshot": "2026-08-04",
+  "note": "post-remediation snapshot (audit 2026-08-04)"
+ }
+}

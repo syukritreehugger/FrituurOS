@@ -30,7 +30,7 @@ export async function exportDsar(email: string): Promise<DsarActionResult> {
   } = await supabase.auth.getUser();
   if (!user) redirect('/login');
 
-  const [canonical, history, audit] = await Promise.all([
+  const [canonical, audit] = await Promise.all([
     supabase
       .from('canonical_orders')
       .select(
@@ -38,15 +38,22 @@ export async function exportDsar(email: string): Promise<DsarActionResult> {
       )
       .filter('customer->>email', 'eq', email),
     supabase
-      .from('order_state_history')
-      .select('id, canonical_order_id, from_state, to_state, occurred_at')
-      .limit(500),
-    supabase
       .from('audit_log')
       .select('id, action, subject_type, subject_id, created_at')
       .eq('actor_email', email)
       .limit(500),
   ]);
+
+  // DSAR must only include the subject's own history — scope to their order IDs.
+  const orderIds = (canonical.data ?? []).map((o) => o.id);
+  const history =
+    orderIds.length > 0
+      ? await supabase
+          .from('order_state_history')
+          .select('id, canonical_order_id, from_state, to_state, occurred_at')
+          .in('canonical_order_id', orderIds)
+          .limit(500)
+      : { data: [] };
 
   await supabase.from('audit_log').insert({
     actor_user_id: user.id,

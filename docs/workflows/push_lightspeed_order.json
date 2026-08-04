@@ -1,0 +1,1229 @@
+{
+ "name": "push_lightspeed_order",
+ "nodes": [
+  {
+   "id": "trigger-manual",
+   "name": "Manual Trigger",
+   "type": "n8n-nodes-base.manualTrigger",
+   "position": [
+    0,
+    0
+   ],
+   "parameters": {},
+   "typeVersion": 1
+  },
+  {
+   "id": "trigger-schedule",
+   "name": "Schedule (10s)",
+   "type": "n8n-nodes-base.scheduleTrigger",
+   "position": [
+    0,
+    200
+   ],
+   "parameters": {
+    "rule": {
+     "interval": [
+      {
+       "field": "seconds",
+       "secondsInterval": 10
+      }
+     ]
+    }
+   },
+   "typeVersion": 1.2
+  },
+  {
+   "id": "pgmq-read",
+   "name": "Read q_orders_push_ls",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    250,
+    100
+   ],
+   "parameters": {
+    "query": "SELECT msg_id, message FROM pgmq_read_order('q_orders_push_ls', 60, 1);",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "parse-messages",
+   "name": "Parse Messages",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    500,
+    100
+   ],
+   "parameters": {
+    "jsCode": "const items = $input.all();\nif (!items.length || !items[0].json.msg_id) return [];\nreturn items.map(i => {\n  const msg = typeof i.json.message === 'string' ? JSON.parse(i.json.message) : i.json.message;\n  return { json: { ...i.json, ...msg } };\n});"
+   },
+   "typeVersion": 2
+  },
+  {
+   "id": "load-order",
+   "name": "Load Canonical Order",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    750,
+    100
+   ],
+   "parameters": {
+    "query": "=SELECT co.id, co.source, co.external_ref, co.location_key, co.order_type, co.status, co.customer, co.items, co.payment, co.vat_lines, co.correlation_id, co.ls_order_id, co.ls_customer_id, COALESCE(dl.is_active, true) AS location_active, COALESCE(dl.deliverect_active, false) AS deliverect_active, ro.raw_payload->>'restaurant_estimated_delivery_time' AS raw_est_delivery, ro.raw_payload->>'restaurant_estimated_pickup_time' AS raw_est_pickup, ro.raw_payload->'note_attributes' AS raw_note_attributes, COALESCE((  co.external_ref ILIKE '%TEST%'   OR EXISTS (    SELECT 1 FROM jsonb_array_elements(co.items) AS i(v)     WHERE (v->>'name') ILIKE '%TEST%'        OR (v->>'name') ILIKE '%NIET BEREIDEN%'        OR (v->>'plu')  ILIKE 'SHOP-%'  )), false) AS is_test_order FROM canonical_orders co LEFT JOIN dim_location dl ON dl.location_key = co.location_key LEFT JOIN raw_orders ro ON ro.id = co.raw_payload_id WHERE co.id = '{{ $json.canonical_id }}'::uuid;",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "load-dim-location",
+   "name": "Load dim_location",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1000,
+    100
+   ],
+   "parameters": {
+    "query": "=SELECT lightspeed_company_id, ls_table_ids, payment_type_ids FROM dim_location WHERE location_key = '{{ $json.location_key }}';",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "load-token",
+   "name": "Load LS Token",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1250,
+    100
+   ],
+   "parameters": {
+    "query": "=SELECT access_token FROM ls_tokens WHERE location_key = '{{ $('Load Canonical Order').item.json.location_key }}';",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "state-pushing-ls",
+   "name": "State \u2192 pushing_ls",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1500,
+    100
+   ],
+   "parameters": {
+    "query": "=UPDATE canonical_orders SET status = 'pushing_ls' WHERE id = '{{ $('Load Canonical Order').item.json.id }}'::uuid AND status IN ('normalized', 'ls_failed') RETURNING id;",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "build-customer",
+   "name": "Build Customer Payload",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    1750,
+    100
+   ],
+   "parameters": {
+    "jsCode": "const allOrders = $('Load Canonical Order').all();\nconst allDims = $('Load dim_location').all();\nconst allTokens = $('Load LS Token').all();\n\nreturn allOrders.map((orderItem, idx) => {\n  const order = orderItem.json;\n  const dim = allDims[idx].json;\n  const customer = typeof order.customer === 'string' ? JSON.parse(order.customer) : order.customer;\n  const extRef = order.external_ref;\n\n  const email = `shop-${extRef}@frituuros.internal`;\n  const nameParts = (customer.name || 'Guest').trim().split(/\\s+/);\n  const firstName = nameParts[0] || 'Guest';\n  const lastName = nameParts.slice(1).join(' ') || '.';\n\n  // LS POS delivery ticket renders deliveryStreet only (never deliveryStreetNumber),\n  // so the full address line - house number included - must live in one field.\n  const addr = customer.address || {};\n  const fullLine = [addr.line1, addr.line2].filter(Boolean).join(' ').trim();\n\n  return {\n    json: {\n      customer_payload: {\n        email,\n        firstName,\n        lastName,\n        telephone: customer.phone || '',\n        companyId: Number(dim.lightspeed_company_id),\n        city: addr.city || '',\n        country: addr.country || '',\n        street: fullLine,\n        streetNumber: '',\n        zip: addr.postal_code || '',\n        deliveryStreet: fullLine,\n        deliveryStreetNumber: '',\n        deliveryZip: addr.postal_code || '',\n        deliveryCity: addr.city || '',\n        deliveryCountry: addr.country || ''\n      },\n      access_token: allTokens[idx].json.access_token,\n      company_id: dim.lightspeed_company_id\n    }\n  };\n});\n"
+   },
+   "typeVersion": 2
+  },
+  {
+   "id": "create-customer",
+   "name": "POST /core/customer",
+   "type": "n8n-nodes-base.httpRequest",
+   "onError": "continueRegularOutput",
+   "position": [
+    2000,
+    100
+   ],
+   "parameters": {
+    "url": "=https://lightspeedapis.com/resto/rest/core/customer",
+    "method": "POST",
+    "options": {
+     "timeout": 15000,
+     "response": {
+      "response": {
+       "fullResponse": true,
+       "responseFormat": "json"
+      }
+     }
+    },
+    "jsonBody": "={{ JSON.stringify($json.customer_payload) }}",
+    "sendBody": true,
+    "contentType": "json",
+    "sendHeaders": true,
+    "specifyBody": "json",
+    "specifyHeaders": "keypair",
+    "headerParameters": {
+     "parameters": [
+      {
+       "name": "Authorization",
+       "value": "=Bearer {{ $json.access_token }}"
+      },
+      {
+       "name": "Content-Type",
+       "value": "application/json"
+      }
+     ]
+    }
+   },
+   "typeVersion": 4.2
+  },
+  {
+   "id": "build-order-payload",
+   "name": "Build Order Payload",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    2250,
+    100
+   ],
+   "parameters": {
+    "jsCode": "const allOrders = $('Load Canonical Order').all();\nconst allDims = $('Load dim_location').all();\nconst allCustomerResps = $('POST /core/customer').all();\nconst allBuildCustomer = $('Build Customer Payload').all();\nconst allMsgs = $('Parse Messages').all();\nconst allCatalog = $('Load LS Catalog SKUs').all();\n\nfunction centsToEur(c) { return Math.round(c) / 100; }\nfunction eurToCents(e) { return Math.round(Number(e) * 100); }\n\n// deliveryDate must be the promised delivery time, in the FUTURE. The POS only\n// auto-processes/prints orders whose deliveryDate has not passed (Deliverect set\n// promised time +15min; a past date leaves the order waiting for a manual print).\nfunction computeDeliveryDate(order, dim) {\n  const now = Date.now();\n  const zone = (dim && dim.timezone) || 'Europe/Brussels';\n  const fallback = () => new Date(now + 15 * 60 * 1000).toISOString();\n  try {\n    let DT = (typeof DateTime !== 'undefined') ? DateTime : null;\n    if (!DT) { try { DT = require('luxon').DateTime; } catch (e) { DT = null; } }\n    if (order.source === 'takeaway') {\n      const est = order.order_type === 'delivery'\n        ? (order.raw_est_delivery || order.raw_est_pickup)\n        : (order.raw_est_pickup || order.raw_est_delivery);\n      if (est) {\n        const t = new Date(est);\n        if (!isNaN(t.getTime()) && t.getTime() > now + 5 * 60 * 1000) return t.toISOString();\n      }\n      return fallback();\n    }\n    if (order.source === 'shopify') {\n      let attrsRaw = order.raw_note_attributes;\n      if (typeof attrsRaw === 'string') { try { attrsRaw = JSON.parse(attrsRaw); } catch (e) { attrsRaw = null; } }\n      if (!Array.isArray(attrsRaw) || !DT) return fallback();\n      const attrs = {};\n      for (const a of attrsRaw) attrs[String(a.name || '').toLowerCase().trim()] = String(a.value || '');\n      const timeStr = attrs['levertijd'] || attrs['delivery time'] || attrs['afhaaltijd'] || attrs['pickup time'] || '';\n      const dateStr = attrs['leverdatum'] || attrs['delivery date'] || attrs['afhaaldatum'] || attrs['pickup date'] || '';\n      const tm = timeStr.match(/(\\d{1,2}):(\\d{2})\\s*(AM|PM)?/i);\n      if (!tm) return fallback();\n      let hh = parseInt(tm[1], 10);\n      const mm = parseInt(tm[2], 10);\n      const ap = (tm[3] || '').toUpperCase();\n      if (ap === 'PM' && hh < 12) hh += 12;\n      if (ap === 'AM' && hh === 12) hh = 0;\n      let day = DT.now().setZone(zone);\n      if (dateStr) {\n        if (/^\\d{4}-\\d{2}-\\d{2}T/.test(dateStr)) {\n          const d = DT.fromISO(dateStr);\n          if (d.isValid) day = d.setZone(zone);\n        } else {\n          const MONTHS = { januari: 1, februari: 2, maart: 3, april: 4, mei: 5, juni: 6, juli: 7, augustus: 8, september: 9, oktober: 10, november: 11, december: 12 };\n          const dm = dateStr.toLowerCase().match(/(\\d{1,2})\\s+(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december)\\s+(\\d{4})/);\n          if (dm) day = DT.fromObject({ year: +dm[3], month: MONTHS[dm[2]], day: +dm[1] }, { zone });\n        }\n      }\n      const slot = day.set({ hour: hh, minute: mm, second: 0, millisecond: 0 });\n      if (slot.isValid && slot.toMillis() > now + 5 * 60 * 1000) return slot.toUTC().toISO();\n      return fallback();\n    }\n  } catch (e) { /* fall through */ }\n  return fallback();\n}\n\n// Build LS catalog Map<sku, priceCents> per location. Used to enforce price\n// source-of-truth: LS catalog price wins when higher than Shopify (Joef rule -\n// if LS=2.50 and Shopify=2.40, the Shopify price is stale; LS receipt must print\n// the correct 2.50). orderPayments.amount stays = customer paid total.\nconst catalogPriceBySku = new Map();\nfor (const row of allCatalog) {\n  const sku = row.json?.sku;\n  const price = row.json?.price;\n  if (sku && price != null) catalogPriceBySku.set(sku, eurToCents(price));\n}\n\nreturn allOrders.map((orderItem, idx) => {\n  const order = orderItem.json;\n  const dim = allDims[idx].json;\n  const customerResponse = allCustomerResps[idx].json;\n  const buildCustomer = allBuildCustomer[idx].json;\n  const msg = allMsgs[idx].json;\n\n  let customerId = 0;\n  const respBody = customerResponse.body;\n  if (typeof respBody === 'number' && respBody > 0) {\n    customerId = respBody;\n  } else if (respBody?.id) {\n    customerId = respBody.id;\n  } else if (customerResponse.data && typeof customerResponse.data === 'number') {\n    customerId = customerResponse.data;\n  }\n  if (!customerId && order.ls_customer_id) {\n    customerId = Number(order.ls_customer_id);\n  }\n\n  const items = typeof order.items === 'string' ? JSON.parse(order.items) : order.items;\n  const payment = typeof order.payment === 'string' ? JSON.parse(order.payment) : order.payment;\n  const lsTableIds = typeof dim.ls_table_ids === 'string' ? JSON.parse(dim.ls_table_ids) : (dim.ls_table_ids || {});\n  const paymentTypeIds = typeof dim.payment_type_ids === 'string' ? JSON.parse(dim.payment_type_ids) : (dim.payment_type_ids || {});\n\n  const orderType = order.order_type === 'delivery' ? 'delivery' : 'takeaway';\n  const SROVA_VENDOR = 'via Srova Data';\n  const channelLabel = order.source === 'shopify' ? 'SHOPIFY' : order.source === 'takeaway' ? 'TAKEAWAY' : String(order.source).toUpperCase();\n  const orderTypeLabel = orderType === 'delivery' ? 'DELIVERY' : 'TAKEAWAY';\n  const tableKey = `${order.source}_${order.order_type === 'delivery' ? 'delivery' : 'pickup'}`;\n  const tableId = lsTableIds[tableKey] || 0;\n\n  const channelKey = order.source === 'shopify' ? 'SHOPIFY API' : order.source === 'takeaway' ? 'TAKEAWAY_V2 API' : 'DELIVERECT API';\n  const pt = paymentTypeIds[channelKey] || { id: 0, typeId: 0 };\n\n  function payAtDoorWarning(p, totalEur) {\n    if (p.status !== 'pending') return '';\n    const labels = { cash: 'CASH', bancontact: 'BANCONTACT', voucher: 'BON', card_online: 'CASH/CARD' };\n    const label = labels[p.method];\n    return label ? ` | TE BETALEN: ${label} \u20ac${totalEur.toFixed(2)}` : '';\n  }\n\n  let customerObj = typeof order.customer === 'string' ? JSON.parse(order.customer) : order.customer;\n  customerObj = customerObj || {};\n  const customerNote = (customerObj.notes || '').trim();\n\n  // Safety net: LS ticket templates vary - the address also goes into the order\n  // note so it is always visible regardless of which fields the template prints.\n  const addrO = customerObj.address || {};\n  const addrFullLine = [\n    [addrO.line1, addrO.line2].filter(Boolean).join(' ').trim(),\n    [addrO.postal_code, addrO.city].filter(Boolean).join(' ').trim()\n  ].filter(Boolean).join(', ');\n\n  const itemNotes = (items || []).filter(it => it.notes).map(it => `- ${it.name}: ${it.notes}`).join('\\n');\n\n  const orderItems = items.map(item => {\n    // Price source-of-truth: prefer LS catalog price when higher.\n    // Compound SKUs already split at normalize: item.plu = base PLU.\n    const shopifyCents = Number(item.unit_price_cents) || 0;\n    const catalogCents = catalogPriceBySku.get(item.plu);\n    const effectiveCents = (catalogCents != null && catalogCents > shopifyCents) ? catalogCents : shopifyCents;\n    const unitPrice = centsToEur(effectiveCents);\n\n    const mods = (item.modifiers || []).map(m => ({\n      plu: m.plu, modifierId: 0, modifierValueId: 0,\n      price: centsToEur(m.unit_price_cents),\n      priceWithoutVat: centsToEur(m.unit_price_cents),\n      description: m.name\n    }));\n    return {\n      productPlu: item.plu, amount: item.qty, unitPrice,\n      totalPrice: unitPrice * item.qty,\n      unitPriceWithoutVat: unitPrice,\n      totalPriceWithoutVat: unitPrice * item.qty,\n      modifiers: mods\n    };\n  });\n\n  const payload = {\n    type: orderType,\n    description: `${channelLabel} \u00b7 ${order.external_ref} \u00b7 ${SROVA_VENDOR}`,\n    companyId: Number(dim.lightspeed_company_id),\n    customerId, tableId,\n    deliveryDate: computeDeliveryDate(order, dim),\n    externalReference: order.external_ref,\n    note: [\n      `*** ${channelLabel} \u00b7 ${orderTypeLabel} ***`,\n      `Ref: ${order.external_ref}${payAtDoorWarning(payment, centsToEur(payment.total_cents))}`,\n      orderType === 'delivery' && addrFullLine ? `ADRES: ${addrFullLine}` : '',\n      itemNotes,\n      customerNote ? `KLANT: ${customerNote}` : '',\n      `-- ${SROVA_VENDOR} --`\n    ].filter(Boolean).join('\\n'),\n    status: 'ACCEPTED',\n    orderItems,\n    orderPayments: [{\n      paymentTypeId: pt.id,\n      paymentTypeTypeId: pt.typeId,\n      amount: centsToEur(payment.total_cents),\n      tip: 0\n    }]\n  };\n\n  return {\n    json: {\n      payload,\n      customerId,\n      access_token: buildCustomer.access_token,\n      canonical_id: order.id,\n      external_ref: order.external_ref,\n      location_key: order.location_key,\n      correlation_id: order.correlation_id,\n      msg_id: msg.msg_id\n    }\n  };\n});\n"
+   },
+   "typeVersion": 2
+  },
+  {
+   "id": "push-order",
+   "name": "POST /establishmentorder",
+   "type": "n8n-nodes-base.httpRequest",
+   "onError": "continueRegularOutput",
+   "position": [
+    2500,
+    100
+   ],
+   "parameters": {
+    "url": "=https://lightspeedapis.com/resto/rest/onlineordering/customer/{{ $json.customerId }}/establishmentorder",
+    "method": "POST",
+    "options": {
+     "timeout": 15000,
+     "response": {
+      "response": {
+       "fullResponse": true,
+       "responseFormat": "json"
+      }
+     }
+    },
+    "jsonBody": "={{ JSON.stringify($json.payload) }}",
+    "sendBody": true,
+    "contentType": "json",
+    "sendHeaders": true,
+    "specifyBody": "json",
+    "specifyHeaders": "keypair",
+    "headerParameters": {
+     "parameters": [
+      {
+       "name": "Authorization",
+       "value": "=Bearer {{ $json.access_token }}"
+      },
+      {
+       "name": "Content-Type",
+       "value": "application/json"
+      },
+      {
+       "name": "X-Correlation-Id",
+       "value": "={{ $json.correlation_id }}"
+      }
+     ]
+    }
+   },
+   "typeVersion": 4.2
+  },
+  {
+   "id": "classify-response",
+   "name": "Classify Response",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    2750,
+    100
+   ],
+   "parameters": {
+    "jsCode": "const resp = $('POST /establishmentorder').item.json;\nconst input = $('Build Order Payload').item.json;\n\nconst statusCode = resp.statusCode || resp.status || resp.error?.status || 0;\nconst body = resp.body ?? resp.data ?? resp;\n\nconst lsOrderId = (statusCode === 201 && typeof body === 'number') ? body : (body?.id ?? null);\n\nlet action, alert = false, validationError = null;\n\nif (statusCode === 201 || statusCode === 200) {\n  action = 'success';\n} else if (statusCode === 409) {\n  action = 'skip_success';\n} else if (statusCode === 401) {\n  action = 'retry';\n} else if (statusCode === 400) {\n  action = 'dlq';\n  alert = true;\n  validationError = resp.error?.message || body;\n} else if (statusCode === 403) {\n  action = 'dlq';\n  alert = true;\n} else if (statusCode >= 500 || statusCode === 429 || statusCode === 0) {\n  action = 'retry';\n} else {\n  action = 'dlq';\n  alert = true;\n}\n\n// SQL-safe error snippet for the DLQ insert (single quotes doubled, truncated)\nconst errorText = String(\n  typeof validationError === 'object' && validationError !== null\n    ? JSON.stringify(validationError)\n    : (validationError ?? `HTTP ${statusCode}`)\n).slice(0, 400).replace(/'/g, \"''\");\n\nreturn [{\n  json: {\n    action,\n    alert,\n    validationError,\n    error_text: errorText,\n    lsOrderId,\n    statusCode,\n    canonical_id: input.canonical_id,\n    external_ref: input.external_ref,\n    location_key: input.location_key,\n    correlation_id: input.correlation_id,\n    customerId: input.customerId,\n    msg_id: input.msg_id\n  }\n}];"
+   },
+   "typeVersion": 2
+  },
+  {
+   "id": "if-success",
+   "name": "IF Success",
+   "type": "n8n-nodes-base.if",
+   "position": [
+    3000,
+    0
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "success",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       },
+       "leftValue": "={{ $json.action }}",
+       "rightValue": "success"
+      }
+     ]
+    }
+   },
+   "typeVersion": 2.2
+  },
+  {
+   "id": "if-skip",
+   "name": "IF Skip (409)",
+   "type": "n8n-nodes-base.if",
+   "position": [
+    3000,
+    200
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "skip",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       },
+       "leftValue": "={{ $json.action }}",
+       "rightValue": "skip_success"
+      }
+     ]
+    }
+   },
+   "typeVersion": 2.2
+  },
+  {
+   "id": "if-retry",
+   "name": "IF Retry",
+   "type": "n8n-nodes-base.if",
+   "position": [
+    3000,
+    400
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "retry",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       },
+       "leftValue": "={{ $json.action }}",
+       "rightValue": "retry"
+      }
+     ]
+    }
+   },
+   "typeVersion": 2.2
+  },
+  {
+   "id": "if-dlq",
+   "name": "IF DLQ",
+   "type": "n8n-nodes-base.if",
+   "position": [
+    3000,
+    600
+   ],
+   "parameters": {
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "dlq",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       },
+       "leftValue": "={{ $json.action }}",
+       "rightValue": "dlq"
+      }
+     ]
+    }
+   },
+   "typeVersion": 2.2
+  },
+  {
+   "id": "success-update",
+   "name": "Success: Update + Enqueue Poll",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    3250,
+    0
+   ],
+   "parameters": {
+    "query": "=UPDATE canonical_orders SET ls_order_id = '{{ $json.lsOrderId }}', ls_customer_id = {{ $json.customerId }}, ls_pushed_at = now(), status = 'ls_sent' WHERE id = '{{ $json.canonical_id }}'::uuid;\nSELECT pgmq_send_order('q_orders_poll_ls', json_build_object('canonical_id', '{{ $json.canonical_id }}', 'ls_order_id', '{{ $json.lsOrderId }}', 'location_key', '{{ $json.location_key }}', 'started_at', now()::text)::jsonb);\nSELECT pgmq_delete_order('q_orders_push_ls', {{ $json.msg_id }});",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "skip-delete",
+   "name": "Skip (409): Delete msg",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    3250,
+    200
+   ],
+   "parameters": {
+    "query": "=SELECT pgmq_delete_order('q_orders_push_ls', {{ $json.msg_id }});",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "retry-set-vt",
+   "name": "Retry: Set VT 60s",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    3250,
+    400
+   ],
+   "parameters": {
+    "query": "=SELECT pgmq_set_vt_order('q_orders_push_ls', {{ $json.msg_id }}, 60);",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "dlq-archive",
+   "name": "DLQ: Archive + ls_failed",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    3250,
+    600
+   ],
+   "parameters": {
+    "query": "=SELECT pgmq_archive_order('q_orders_push_ls', {{ $json.msg_id }});\nUPDATE canonical_orders SET status = 'ls_failed', cancel_reason = 'LS push failed (HTTP {{ $json.statusCode }}): ' || '{{ $json.error_text }}' WHERE id = '{{ $json.canonical_id }}'::uuid;\nINSERT INTO dlq_alerts (queue_name, msg_id, external_ref, source, location_key, canonical_order_id, last_error, attempt_count, alerted_at, created_at)\nSELECT 'q_orders_push_ls', {{ $json.msg_id }}, co.external_ref, co.source::text, co.location_key, co.id,\n  jsonb_build_object('message', 'LS push rejected: ' || '{{ $json.error_text }}', 'code', '{{ $json.statusCode }}', 'stage', 'ls_push', 'runbook', 'Check payload vs LS API (payment type ids, PLUs, customer). Fix cause then retry from /alerts.'),\n  1, now(), now()\nFROM canonical_orders co WHERE co.id = '{{ $json.canonical_id }}'::uuid;",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "if-idempotency-skip-node",
+   "name": "IF Idempotency Skip",
+   "type": "n8n-nodes-base.if",
+   "position": [
+    2400,
+    100
+   ],
+   "parameters": {
+    "options": {},
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "idempotency-skip",
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       },
+       "leftValue": "={{ $json.idempotency_skip }}",
+       "rightValue": true
+      }
+     ]
+    }
+   },
+   "typeVersion": 2.2
+  },
+  {
+   "id": "adopt-existing-ls-order-node",
+   "name": "Adopt Existing LS Order",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    2650,
+    0
+   ],
+   "parameters": {
+    "query": "UPDATE canonical_orders SET status = 'pushing_ls' WHERE id = '{{ $json.canonical_id }}'::uuid AND status IN ('normalized', 'ls_failed');\nUPDATE canonical_orders SET ls_order_id = '{{ $json.existing_ls_order_id }}', ls_pushed_at = now(), status = 'ls_sent' WHERE id = '{{ $json.canonical_id }}'::uuid AND status = 'pushing_ls';\nSELECT pgmq_send_order('q_orders_poll_ls', json_build_object('canonical_id', '{{ $json.canonical_id }}', 'ls_order_id', '{{ $json.existing_ls_order_id }}', 'location_key', '{{ $json.location_key }}', 'started_at', now()::text, 'idempotency_adopt', true)::jsonb);\nSELECT pgmq_delete_order('q_orders_push_ls', {{ $json.msg_id }});",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "check-ls-existing-node",
+   "name": "Check LS Existing",
+   "type": "n8n-nodes-base.httpRequest",
+   "onError": "continueRegularOutput",
+   "position": [
+    1750,
+    250
+   ],
+   "parameters": {
+    "url": "https://lightspeedapis.com/resto/rest/onlineordering/order",
+    "method": "GET",
+    "options": {
+     "timeout": 10000,
+     "response": {
+      "response": {
+       "fullResponse": true,
+       "responseFormat": "json"
+      }
+     }
+    },
+    "sendQuery": true,
+    "sendHeaders": true,
+    "specifyQuery": "keypair",
+    "specifyHeaders": "keypair",
+    "queryParameters": {
+     "parameters": [
+      {
+       "name": "createdSince",
+       "value": "={{ new Date(Date.now() - 3600000).toISOString() }}"
+      },
+      {
+       "name": "amount",
+       "value": "100"
+      }
+     ]
+    },
+    "headerParameters": {
+     "parameters": [
+      {
+       "name": "Authorization",
+       "value": "=Bearer {{ $('Load LS Token').item.json.access_token }}"
+      },
+      {
+       "name": "accept",
+       "value": "application/json"
+      }
+     ]
+    }
+   },
+   "typeVersion": 4.2
+  },
+  {
+   "id": "filter-ls-idempotency-node",
+   "name": "Filter LS Idempotency",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    1900,
+    250
+   ],
+   "parameters": {
+    "jsCode": "const httpResp = $('Check LS Existing').all();\nconst orders = $('Load Canonical Order').all();\nconst tokens = $('Load LS Token').all();\nconst msgs = $('Parse Messages').all();\n\nreturn orders.map((orderItem, idx) => {\n  const order = orderItem.json;\n  const externalRef = order.external_ref;\n  const resp = httpResp[idx]?.json;\n  const tok = tokens[idx]?.json;\n  const msg = msgs[idx]?.json;\n  \n  let lsOrders = [];\n  if (Array.isArray(resp)) lsOrders = resp;\n  else if (Array.isArray(resp?.body)) lsOrders = resp.body;\n  else if (Array.isArray(resp?.data)) lsOrders = resp.data;\n  \n  const match = lsOrders.find(o => o && o.externalReference === externalRef);\n  \n  const baseOut = {\n    canonical_id: order.id,\n    external_ref: externalRef,\n    location_key: order.location_key,\n    correlation_id: order.correlation_id,\n    msg_id: msg?.msg_id,\n    access_token: tok?.access_token,\n    ls_orders_returned: lsOrders.length\n  };\n  \n  if (match && match.id) {\n    return {\n      json: {\n        ...baseOut,\n        idempotency_skip: true,\n        existing_ls_order_id: String(match.id),\n        existing_status: match.status\n      }\n    };\n  }\n  \n  return {\n    json: {\n      ...baseOut,\n      idempotency_skip: false\n    }\n  };\n});\n"
+   },
+   "typeVersion": 2
+  },
+  {
+   "id": "load-ls-catalog-skus-node",
+   "name": "Load LS Catalog SKUs",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1150,
+    100
+   ],
+   "parameters": {
+    "query": "=SELECT r.sku, r.price\nFROM public.raw_ls_products r\nWHERE r.location_key = '{{ $('Load Canonical Order').item.json.location_key }}'\n  AND r.visible = true\n  AND r.sku IS NOT NULL AND r.sku <> ''\n  AND r.sku = ANY(\n    ARRAY(\n      SELECT DISTINCT plu FROM (\n        SELECT jsonb_array_elements(co.items)->>'plu' AS plu\n        FROM public.canonical_orders co\n        WHERE co.id IN ({{ $('Load Canonical Order').all().map(o => \"'\" + o.json.id + \"'::uuid\").join(',') }})\n        UNION ALL\n        SELECT jsonb_array_elements(jsonb_array_elements(co.items)->'modifiers')->>'plu'\n        FROM public.canonical_orders co\n        WHERE co.id IN ({{ $('Load Canonical Order').all().map(o => \"'\" + o.json.id + \"'::uuid\").join(',') }})\n      ) AS all_plus\n      WHERE plu IS NOT NULL AND plu <> ''\n    )\n  );\n",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "validate-order-plus-node",
+   "name": "Validate Order PLUs",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    1300,
+    100
+   ],
+   "parameters": {
+    "jsCode": "const skuRows = $input.all();\nconst orders = $('Load Canonical Order').all();\nconst msgs = $('Parse Messages').all();\n\nconst validSkus = new Set(skuRows.map(r => r.json.sku));\n\nreturn orders.map((orderItem, idx) => {\n  const order = orderItem.json;\n  const msg = msgs[idx].json;\n  const items = typeof order.items === 'string' ? JSON.parse(order.items) : order.items;\n  \n  const requiredPlus = new Set();\n  for (const item of (items || [])) {\n    if (item.plu) requiredPlus.add(item.plu);\n    for (const mod of (item.modifiers || [])) {\n      if (mod.plu) requiredPlus.add(mod.plu);\n    }\n  }\n  \n  const missing = [...requiredPlus].filter(plu => !validSkus.has(plu));\n  \n  return {\n    json: {\n      all_valid: missing.length === 0,\n      missing_plus: missing,\n      missing_plus_str: missing.join(', '),\n      missing_plus_json: JSON.stringify(missing),\n      required_count: requiredPlus.size,\n      catalog_size: validSkus.size,\n      canonical_id: order.id,\n      external_ref: order.external_ref,\n      source: order.source,\n      location_key: order.location_key,\n      correlation_id: order.correlation_id,\n      msg_id: msg.msg_id,\n    },\n  };\n});"
+   },
+   "typeVersion": 2
+  },
+  {
+   "id": "if-plu-valid-node",
+   "name": "IF PLU Valid",
+   "type": "n8n-nodes-base.if",
+   "position": [
+    1450,
+    100
+   ],
+   "parameters": {
+    "options": {},
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "plu-valid",
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       },
+       "leftValue": "={{ $json.all_valid }}",
+       "rightValue": true
+      }
+     ]
+    }
+   },
+   "typeVersion": 2.2
+  },
+  {
+   "id": "dlq-plu-mismatch-node",
+   "name": "DLQ: PLU Mismatch",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1600,
+    350
+   ],
+   "parameters": {
+    "query": "=UPDATE canonical_orders SET status = 'pushing_ls' WHERE id = '{{ $json.canonical_id }}'::uuid AND status IN ('normalized', 'ls_failed');\nUPDATE canonical_orders SET status = 'ls_failed', cancel_reason = 'PLU validation failed: ' || '{{ $json.missing_plus_str }}' WHERE id = '{{ $json.canonical_id }}'::uuid AND status = 'pushing_ls';\nINSERT INTO dlq_alerts (queue_name, msg_id, external_ref, source, location_key, canonical_order_id, last_error, attempt_count, alerted_at, created_at) VALUES ('q_orders_push_ls', {{ $json.msg_id }}, '{{ $json.external_ref }}', '{{ $json.source }}', '{{ $json.location_key }}', '{{ $json.canonical_id }}'::uuid, jsonb_build_object('message', 'Cannot push to LS for ' || '{{ $json.location_key }}' || ': ' || '{{ $json.missing_plus_str }}', 'code', '11401', 'stage', 'plu_validation', 'missing_plus', '{{ $json.missing_plus_json }}'::jsonb, 'runbook', 'AMBIGUOUS:Name = LS catalog has 2+ products with this name, pick correct mapping at /menu Takeaway tab. UNMAPPED:Name = product not in LS catalog, add to LS POS and sync. Plain PLU = base PLU missing from LS, add to LS POS.'), 1, now(), now());\nSELECT pgmq_delete_order('q_orders_push_ls', {{ $json.msg_id }});",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "gate-location-active",
+   "name": "Gate: Location Active?",
+   "type": "n8n-nodes-base.if",
+   "position": [
+    900,
+    100
+   ],
+   "parameters": {
+    "options": {},
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "location-active",
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       },
+       "leftValue": "={{ $json.location_active }}",
+       "rightValue": true
+      },
+      {
+       "id": "not-test-order",
+       "operator": {
+        "type": "boolean",
+        "operation": "false",
+        "singleValue": true
+       },
+       "leftValue": "={{ $json.is_test_order }}",
+       "rightValue": false
+      }
+     ]
+    }
+   },
+   "typeVersion": 2.2
+  },
+  {
+   "id": "log-location-skip",
+   "name": "Log Location Skip",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1050,
+    300
+   ],
+   "parameters": {
+    "query": "=INSERT INTO public.order_state_history (canonical_order_id, from_state, to_state, reason, correlation_id) VALUES ('{{ $('Load Canonical Order').item.json.id }}'::uuid, '{{ $('Load Canonical Order').item.json.status }}'::order_state, '{{ $('Load Canonical Order').item.json.status }}'::order_state, 'location_paused', NULLIF('{{ $('Load Canonical Order').item.json.correlation_id }}', '')::uuid);",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "ack-skipped-msg",
+   "name": "Ack Skipped Msg",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1200,
+    300
+   ],
+   "parameters": {
+    "query": "=SELECT public.pgmq_delete_order('q_orders_push_ls', {{ $('Parse Messages').item.json.msg_id }});",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "if-deliverect-yield-ls",
+   "name": "IF NOT Deliverect Active?",
+   "type": "n8n-nodes-base.if",
+   "position": [
+    970,
+    100
+   ],
+   "parameters": {
+    "options": {},
+    "conditions": {
+     "options": {
+      "version": 2,
+      "leftValue": "",
+      "caseSensitive": true,
+      "typeValidation": "strict"
+     },
+     "combinator": "and",
+     "conditions": [
+      {
+       "id": "condition-1781695422948-1d22exi8k",
+       "operator": {
+        "type": "boolean",
+        "operation": "false",
+        "singleValue": true
+       },
+       "leftValue": "={{ $json.deliverect_active }}",
+       "rightValue": false
+      }
+     ]
+    }
+   },
+   "typeVersion": 2.2
+  },
+  {
+   "id": "log-deliverect-yield-ls",
+   "name": "Log Deliverect Yield (LS)",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1050,
+    450
+   ],
+   "parameters": {
+    "query": "=INSERT INTO public.order_state_history (canonical_order_id, from_state, to_state, reason, correlation_id) VALUES ('{{ $('Load Canonical Order').item.json.id }}'::uuid, '{{ $('Load Canonical Order').item.json.status }}'::order_state, '{{ $('Load Canonical Order').item.json.status }}'::order_state, 'deliverect_yield', NULLIF('{{ $('Load Canonical Order').item.json.correlation_id }}', '')::uuid);",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "ack-deliverect-yield-ls",
+   "name": "Ack Deliverect Yield (LS)",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1200,
+    450
+   ],
+   "parameters": {
+    "query": "=SELECT public.pgmq_delete_order('q_orders_push_ls', {{ $('Parse Messages').item.json.msg_id }});",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  }
+ ],
+ "connections": {
+  "Manual Trigger": {
+   "main": [
+    [
+     {
+      "node": "Read q_orders_push_ls",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Schedule (10s)": {
+   "main": [
+    [
+     {
+      "node": "Read q_orders_push_ls",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Read q_orders_push_ls": {
+   "main": [
+    [
+     {
+      "node": "Parse Messages",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse Messages": {
+   "main": [
+    [
+     {
+      "node": "Load Canonical Order",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load LS Token": {
+   "main": [
+    [
+     {
+      "node": "Check LS Existing",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "State \u2192 pushing_ls": {
+   "main": [
+    [
+     {
+      "node": "Build Customer Payload",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build Customer Payload": {
+   "main": [
+    [
+     {
+      "node": "POST /core/customer",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "POST /core/customer": {
+   "main": [
+    [
+     {
+      "node": "Build Order Payload",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build Order Payload": {
+   "main": [
+    [
+     {
+      "node": "POST /establishmentorder",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "POST /establishmentorder": {
+   "main": [
+    [
+     {
+      "node": "Classify Response",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Classify Response": {
+   "main": [
+    [
+     {
+      "node": "IF Success",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "IF Skip (409)",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "IF Retry",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "IF DLQ",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF Success": {
+   "main": [
+    [
+     {
+      "node": "Success: Update + Enqueue Poll",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    []
+   ]
+  },
+  "IF Skip (409)": {
+   "main": [
+    [
+     {
+      "node": "Skip (409): Delete msg",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    []
+   ]
+  },
+  "IF Retry": {
+   "main": [
+    [
+     {
+      "node": "Retry: Set VT 60s",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    []
+   ]
+  },
+  "IF DLQ": {
+   "main": [
+    [
+     {
+      "node": "DLQ: Archive + ls_failed",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    []
+   ]
+  },
+  "IF Idempotency Skip": {
+   "main": [
+    [
+     {
+      "node": "Adopt Existing LS Order",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "State \u2192 pushing_ls",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Adopt Existing LS Order": {
+   "main": [
+    []
+   ]
+  },
+  "Check LS Existing": {
+   "main": [
+    [
+     {
+      "node": "Filter LS Idempotency",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Filter LS Idempotency": {
+   "main": [
+    [
+     {
+      "node": "IF Idempotency Skip",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load dim_location": {
+   "main": [
+    [
+     {
+      "node": "Load LS Catalog SKUs",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load LS Catalog SKUs": {
+   "main": [
+    [
+     {
+      "node": "Validate Order PLUs",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Validate Order PLUs": {
+   "main": [
+    [
+     {
+      "node": "IF PLU Valid",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF PLU Valid": {
+   "main": [
+    [
+     {
+      "node": "Load LS Token",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "DLQ: PLU Mismatch",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load Canonical Order": {
+   "main": [
+    [
+     {
+      "node": "Gate: Location Active?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Gate: Location Active?": {
+   "main": [
+    [
+     {
+      "node": "IF NOT Deliverect Active?",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Log Location Skip",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Log Location Skip": {
+   "main": [
+    [
+     {
+      "node": "Ack Skipped Msg",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF NOT Deliverect Active?": {
+   "main": [
+    [
+     {
+      "node": "Load dim_location",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Log Deliverect Yield (LS)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Log Deliverect Yield (LS)": {
+   "main": [
+    [
+     {
+      "node": "Ack Deliverect Yield (LS)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "callerPolicy": "workflowsFromSameOwner",
+  "availableInMCP": false,
+  "executionOrder": "v1",
+  "saveDataErrorExecution": "all",
+  "saveDataSuccessExecution": "all",
+  "saveExecutionProgress": true,
+  "saveManualExecutions": true
+ },
+ "_meta": {
+  "n8n_id": "2ENsv7R4I8H5L3cf",
+  "snapshot": "2026-08-04",
+  "note": "post-remediation snapshot (audit 2026-08-04)"
+ }
+}

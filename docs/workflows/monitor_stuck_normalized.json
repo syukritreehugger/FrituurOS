@@ -1,0 +1,132 @@
+{
+  "name": "monitor_stuck_normalized",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true
+  },
+  "nodes": [
+    {
+      "id": "sticky-warning",
+      "name": "INACTIVE — DO NOT ACTIVATE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-400, -300],
+      "parameters": {
+        "color": 3,
+        "width": 520,
+        "height": 220,
+        "content": "## INACTIVE — DO NOT ACTIVATE\n\nThis Deliverect safety-net stays OFF until BOTH are true:\n\n1. **Joef confirms** `dim_location.deliverect_active = true` is the intended runtime flag for safety-net scope (i.e. Deliverect parity mode is live for the location).\n2. **push_lightspeed_order** patched to honour the `deliverect_yield_recovery` re-enqueue payload (bypass / branch path), otherwise re-enqueued normalized orders will loop.\n\nSee memory: `project_deliverect_safety_net_deferred`.\n\nOwner: Aziz. Activation requires explicit go-ahead."
+      }
+    },
+    {
+      "id": "schedule-10m",
+      "name": "Schedule (10m)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": { "rule": { "interval": [{ "field": "minutes", "minutesInterval": 10 }] } }
+    },
+    {
+      "id": "query-stuck-normalized",
+      "name": "Query Stuck Normalized",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [260, 0],
+      "credentials": { "postgres": { "id": "9zc3jzWzgtSSJL0O", "name": "Postgres Data Catalog" } },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT co.id, co.status, co.location_key, co.source, co.external_ref, co.correlation_id, EXTRACT(EPOCH FROM (NOW() - co.created_at))::int AS sec_stuck, COALESCE((co.cancel_reason::jsonb->>'auto_retry_count')::int, 0) AS retry_count FROM canonical_orders co JOIN dim_location dl ON dl.location_key = co.location_key WHERE co.status = 'normalized' AND co.source IN ('shopify','takeaway') AND co.created_at < NOW() - INTERVAL '15 minutes' AND dl.deliverect_active = true LIMIT 50;",
+        "options": {}
+      }
+    },
+    {
+      "id": "split-batches",
+      "name": "Split into Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [520, 0],
+      "parameters": { "batchSize": 1, "options": {} }
+    },
+    {
+      "id": "if-under-retry-limit",
+      "name": "IF Retry < 2",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [780, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "conditions": [{ "id": "under-limit", "leftValue": "={{ $json.retry_count }}", "rightValue": 2, "operator": { "type": "number", "operation": "smaller" } }],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "increment-retry",
+      "name": "Increment Retry Counter (row-lock)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1040, -120],
+      "credentials": { "postgres": { "id": "9zc3jzWzgtSSJL0O", "name": "Postgres Data Catalog" } },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE canonical_orders SET cancel_reason = jsonb_build_object('auto_retry_count', {{ $json.retry_count + 1 }}, 'last_auto_retry', now()::text, 'reason', 'deliverect_yield_recovery', 'previous_status', 'normalized')::text WHERE id = '{{ $json.id }}'::uuid AND status = 'normalized' RETURNING id;",
+        "options": {}
+      }
+    },
+    {
+      "id": "reenqueue-yield-recovery",
+      "name": "Re-enqueue (deliverect_yield_recovery)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1300, -120],
+      "credentials": { "postgres": { "id": "9zc3jzWzgtSSJL0O", "name": "Postgres Data Catalog" } },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT pgmq_send_order('q_orders_push_ls', jsonb_build_object('source', '{{ $json.source }}', 'canonical_id', '{{ $json.id }}', 'external_ref', '{{ $json.external_ref }}', 'location_key', '{{ $json.location_key }}', 'auto_retry', true, 'deliverect_yield_recovery', true, 'started_at', now()::text));",
+        "options": {}
+      }
+    },
+    {
+      "id": "dlq-retry-exhausted",
+      "name": "DLQ: Stuck Normalized (retry exhausted)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1040, 180],
+      "credentials": { "postgres": { "id": "9zc3jzWzgtSSJL0O", "name": "Postgres Data Catalog" } },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dlq_alerts (queue_name, msg_id, external_ref, source, location_key, canonical_order_id, last_error, attempt_count, alerted_at, created_at) SELECT 'q_orders_push_ls', 0, '{{ $json.external_ref }}', '{{ $json.source }}', '{{ $json.location_key }}', '{{ $json.id }}'::uuid, jsonb_build_object('message', 'Order stuck in normalized for ' || '{{ $json.sec_stuck }}' || 's (deliverect safety-net), exceeded ' || '{{ $json.retry_count }}' || ' auto-retries', 'stage', 'deliverect_yield_recovery_exhausted', 'code', 'STUCK_NORMALIZED_RETRY_LIMIT', 'previous_retries', {{ $json.retry_count }}), {{ $json.retry_count }}, now(), now() WHERE NOT EXISTS ( SELECT 1 FROM dlq_alerts d WHERE d.canonical_order_id = '{{ $json.id }}'::uuid AND d.last_error->>'code' = 'STUCK_NORMALIZED_RETRY_LIMIT' AND d.created_at > NOW() - INTERVAL '6 hours');",
+        "options": {}
+      }
+    },
+    {
+      "id": "tg-dlq-alert",
+      "name": "TG DLQ Alert",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [1300, 180],
+      "parameters": {
+        "workflowId": { "__rl": true, "value": "xDhWqSJswrEGNfYL", "mode": "id", "cachedResultName": "notify_telegram" },
+        "workflowInputs": { "mappingMode": "defineBelow", "value": { "text": "=🔴 <b>monitor_stuck_normalized</b> — order stuck di `normalized` masuk DLQ (Deliverect safety-net retry habis) pada {{ new Date().toISOString() }}.\n\nlocation: {{ $json.location_key }} | source: {{ $json.source }} | external_ref: {{ $json.external_ref }} | canonical_id: {{ $json.id }} | sec_stuck: {{ $json.sec_stuck }}\n\nPerlu cek manual di /alerts." } }
+      }
+    },
+    { "id": "loop-back-success", "name": "Loop (success)", "type": "n8n-nodes-base.noOp", "typeVersion": 1, "position": [1560, -120], "parameters": {} },
+    { "id": "loop-back-dlq", "name": "Loop (dlq)", "type": "n8n-nodes-base.noOp", "typeVersion": 1, "position": [1560, 180], "parameters": {} }
+  ],
+  "connections": {
+    "Schedule (10m)": { "main": [[{ "node": "Query Stuck Normalized", "type": "main", "index": 0 }]] },
+    "Query Stuck Normalized": { "main": [[{ "node": "Split into Batches", "type": "main", "index": 0 }]] },
+    "Split into Batches": { "main": [[{ "node": "IF Retry < 2", "type": "main", "index": 0 }]] },
+    "IF Retry < 2": { "main": [[{ "node": "Increment Retry Counter (row-lock)", "type": "main", "index": 0 }], [{ "node": "DLQ: Stuck Normalized (retry exhausted)", "type": "main", "index": 0 }]] },
+    "Increment Retry Counter (row-lock)": { "main": [[{ "node": "Re-enqueue (deliverect_yield_recovery)", "type": "main", "index": 0 }]] },
+    "Re-enqueue (deliverect_yield_recovery)": { "main": [[{ "node": "Loop (success)", "type": "main", "index": 0 }]] },
+    "Loop (success)": { "main": [[{ "node": "Split into Batches", "type": "main", "index": 0 }]] },
+    "DLQ: Stuck Normalized (retry exhausted)": { "main": [[{ "node": "TG DLQ Alert", "type": "main", "index": 0 }]] },
+    "TG DLQ Alert": { "main": [[{ "node": "Loop (dlq)", "type": "main", "index": 0 }]] },
+    "Loop (dlq)": { "main": [[{ "node": "Split into Batches", "type": "main", "index": 0 }]] }
+  }
+}
