@@ -1,7 +1,7 @@
 import { Check, GitBranch, Lock, Truck } from "lucide-react"
 import { PageHeader } from "@/components/dashboard/page-header"
 import { Button } from "@/components/ui/button"
-import { getWorkflow, isN8nConfigured, POLLER_NORMALIZE_ID, LS_PUSHER_ID, TAKEAWAY_POLLER_ID, SHIPDAY_PUSH_WORKFLOW_ID } from "@/lib/n8n"
+import { getWorkflow, getTakeawayPollersStatus, isN8nConfigured, POLLER_NORMALIZE_ID, LS_PUSHER_ID, SHIPDAY_PUSH_WORKFLOW_ID } from "@/lib/n8n"
 import { PipelineToggle } from "./_components/pipeline-toggle"
 import { TakeawayToggle } from "./_components/takeaway-toggle"
 import { ShipdayToggle } from "./_components/shipday-toggle"
@@ -29,13 +29,13 @@ export default async function SettingsPage() {
     const [pollerRes, pusherRes, takeawayRes, shipdayRes] = await Promise.all([
       getWorkflow(POLLER_NORMALIZE_ID),
       getWorkflow(LS_PUSHER_ID),
-      getWorkflow(TAKEAWAY_POLLER_ID),
+      getTakeawayPollersStatus(),
       getWorkflow(SHIPDAY_PUSH_WORKFLOW_ID),
     ])
     if (!pollerRes.ok) pipelineError = `Poller: ${pollerRes.error}`
     else if (!pusherRes.ok) pipelineError = `Pusher: ${pusherRes.error}`
     else pipelineActive = pollerRes.data.active && pusherRes.data.active
-    takeawayPollerActive = takeawayRes.ok ? takeawayRes.data.active : null
+    takeawayPollerActive = takeawayRes.ok ? takeawayRes.allActive : null
     if (!shipdayRes.ok) shipdayError = `Shipday: ${shipdayRes.error}`
     else shipdayDispatchActive = shipdayRes.data.active
   }

@@ -1,6 +1,6 @@
 import { createClient } from '@/lib/supabase/server';
 import { createServiceClient } from '@/lib/supabase/service';
-import { getWorkflow, LS_PUSHER_ID, TAKEAWAY_POLLER_ID } from '@/lib/n8n';
+import { getWorkflow, getTakeawayPollersStatus, LS_PUSHER_ID } from '@/lib/n8n';
 
 export type IntegrationStatus =
   | 'operational'
@@ -64,7 +64,7 @@ export async function getIntegrationHealth(): Promise<IntegrationRow[]> {
       supabase
         .from('takeaway_tokens')
         .select('account_name, location_key, token_expires_at, refresh_expires_at, updated_at'),
-      getWorkflow(TAKEAWAY_POLLER_ID),
+      getTakeawayPollersStatus(),
       supabase
         .from('raw_orders')
         .select('received_at')
@@ -151,7 +151,7 @@ export async function getIntegrationHealth(): Promise<IntegrationRow[]> {
 
     const refreshExpired = refreshExp < now;
     const refreshSoon = refreshExp < now + 7 * 24 * 60 * 60 * 1000;
-    const pollerActiveT = takeawayPollerWf.ok && takeawayPollerWf.data.active;
+    const pollerActiveT = takeawayPollerWf.ok && takeawayPollerWf.allActive;
     const accountList = taTokens.map((t) => `${t.account_name}→${t.location_key}`).join(', ');
 
     if (refreshExpired) takeawayStatus = 'down';
@@ -160,7 +160,9 @@ export async function getIntegrationHealth(): Promise<IntegrationRow[]> {
     const lastOrders = (takeawayLastOrder.data ?? []) as Array<{ received_at: string }>;
     const lastRcv = lastOrders[0]?.received_at;
 
-    const pollerNote = pollerActiveT ? 'poller active' : 'poller paused';
+    const pollerNote = takeawayPollerWf.ok
+      ? `${takeawayPollerWf.active}/${takeawayPollerWf.total} pollers active`
+      : 'poller status unknown';
     takeawayDesc = `${taTokens.length} account${taTokens.length === 1 ? '' : 's'} (${accountList}) · ${pollerNote}`;
 
     if (refreshExpired) {

@@ -7,7 +7,7 @@ import {
   deactivateWorkflow,
   POLLER_NORMALIZE_ID,
   LS_PUSHER_ID,
-  TAKEAWAY_POLLER_ID,
+  setTakeawayPollersActive,
   SHIPDAY_PUSH_WORKFLOW_ID,
 } from '@/lib/n8n';
 import { createClient } from '@/lib/supabase/server';
@@ -84,9 +84,8 @@ export async function setTakeawayPollerActive(
   const auth = await assertManagement();
   if (!auth.ok) return auth;
 
-  const res = active
-    ? await activateWorkflow(TAKEAWAY_POLLER_ID)
-    : await deactivateWorkflow(TAKEAWAY_POLLER_ID);
+  // All three per-location pollers, not just Aalst (C3).
+  const res = await setTakeawayPollersActive(active);
 
   if (!res.ok) return { ok: false, error: res.error };
 

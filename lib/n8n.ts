@@ -13,7 +13,13 @@
 
 export const POLLER_NORMALIZE_ID = '0i4SS4CHZo1h2Poj';
 export const LS_PUSHER_ID = '2ENsv7R4I8H5L3cf';
-export const TAKEAWAY_POLLER_ID = '86E91MXlXNDO5DA6';
+/** One JET poller per location — a toggle/status must cover all of them, not just Aalst. */
+export const TAKEAWAY_POLLER_IDS: Record<string, string> = {
+  LOC_AALST: '86E91MXlXNDO5DA6',
+  LOC_BERLARE: 'nhPFskveanP465z9',
+  LOC_DENDER: 'e4R3OlqGpDVG3DW2',
+};
+export const TAKEAWAY_POLLER_ID = TAKEAWAY_POLLER_IDS['LOC_AALST'] as string;
 export const TAKEAWAY_TOKEN_REFRESH_ID = 'q1r0qcOalSrhzlrq';
 export const SHIPDAY_PUSH_WORKFLOW_ID = 'C3SfhvbDjYPZinKm';
 
@@ -77,4 +83,36 @@ export async function activateWorkflow(id: string) {
 
 export async function deactivateWorkflow(id: string) {
   return n8n<{ active: boolean }>(`/workflows/${id}/deactivate`, { method: 'POST' });
+}
+
+/** Aggregate status across all per-location JET pollers. */
+export async function getTakeawayPollersStatus(): Promise<
+  | { ok: true; active: number; total: number; allActive: boolean }
+  | { ok: false; error: string }
+> {
+  const entries = Object.entries(TAKEAWAY_POLLER_IDS);
+  const results = await Promise.all(entries.map(([, id]) => getWorkflow(id)));
+  const firstErr = results.find((r) => !r.ok);
+  if (firstErr && !firstErr.ok) return { ok: false, error: firstErr.error };
+  const active = results.filter((r) => r.ok && r.data.active).length;
+  return { ok: true, active, total: entries.length, allActive: active === entries.length };
+}
+
+/** Toggle all per-location JET pollers; reports which locations failed. */
+export async function setTakeawayPollersActive(
+  active: boolean
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const toggle = active ? activateWorkflow : deactivateWorkflow;
+  const entries = Object.entries(TAKEAWAY_POLLER_IDS);
+  const results = await Promise.all(entries.map(([, id]) => toggle(id)));
+  const failed = entries
+    .filter(([, ], i) => {
+      const r = results[i];
+      return !r || !r.ok;
+    })
+    .map(([loc]) => loc);
+  if (failed.length > 0) {
+    return { ok: false, error: `Failed for ${failed.join(', ')}` };
+  }
+  return { ok: true };
 }

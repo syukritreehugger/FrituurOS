@@ -17,7 +17,12 @@ export interface PipelineBacklog {
   message: string | null;
 }
 
-const WATCHED_QUEUES = ['q_orders_normalize', 'q_orders_push_ls'] as const;
+const WATCHED_QUEUES = [
+  'q_orders_normalize',
+  'q_orders_push_ls',
+  'q_orders_push_shipday',
+  'q_orders_compensate', // consumer: shipday_compensate — a stuck cancel means a driver dispatched for a failed order
+] as const;
 const WARN_DEPTH = 50;
 const WARN_AGE_SEC = 300; // 5 minutes
 const CRITICAL_AGE_SEC = 1800; // 30 minutes
