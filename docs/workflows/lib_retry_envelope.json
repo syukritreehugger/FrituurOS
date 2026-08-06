@@ -1,0 +1,235 @@
+{
+ "name": "lib_retry_envelope",
+ "connections": {},
+ "settings": {},
+ "_meta": {
+  "n8n_id": "I62yzZFLlFrXl1VT",
+  "snapshot": "2026-08-06",
+  "note": "address fail-open + warning notes (normalize) / literal-SQL DLQ insert (retry ladder) \u2014 poison-message incident 2026-08-06"
+ },
+ "nodes": [
+  {
+   "id": "trigger",
+   "name": "When Called by Another Workflow",
+   "type": "n8n-nodes-base.executeWorkflowTrigger",
+   "position": [
+    200,
+    300
+   ],
+   "parameters": {},
+   "typeVersion": 1
+  },
+  {
+   "id": "load-policy",
+   "name": "Load Retry Policy",
+   "type": "n8n-nodes-base.postgres",
+   "notes": "RULES \u00a77.5 \u2014 DB-driven config, never $env.",
+   "position": [
+    420,
+    300
+   ],
+   "parameters": {
+    "query": "SELECT queue_name, ladder_seconds, max_attempts, jitter_ratio FROM public.pgmq_retry_policy WHERE queue_name = $1 LIMIT 1",
+    "options": {
+     "queryReplacement": "={{ $json.queue_name }}"
+    },
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "invoke-processor",
+   "name": "Invoke Processor",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "position": [
+    640,
+    220
+   ],
+   "parameters": {
+    "options": {},
+    "workflowId": "={{ $('When Called by Another Workflow').item.json.processor_workflow_id }}"
+   },
+   "typeVersion": 1,
+   "continueOnFail": true
+  },
+  {
+   "id": "decide-outcome",
+   "name": "Decide Outcome",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    860,
+    300
+   ],
+   "parameters": {
+    "jsCode": "const envelope = $('When Called by Another Workflow').first().json;\nconst policy   = $('Load Retry Policy').first().json;\nconst proc     = $input.first().json ?? {};\n\nconst attempt        = Number(envelope.attempt_count ?? 1);\nconst ladder         = Array.isArray(policy.ladder_seconds) ? policy.ladder_seconds : [5, 30, 120, 900];\nconst maxAttempts    = Number(policy.max_attempts ?? 5);\nconst jitterRatio    = Number(policy.jitter_ratio ?? 0.20);\n\n// The DLQ INSERT is built here as literal SQL instead of via the Postgres node's\n// queryReplacement: that field is a comma-joined expression list, so any value or\n// expression containing a comma (or a failing sub-expression) silently shifts the\n// parameter positions -> \"there is no parameter $N\" and the poison message can never\n// leave the queue. It blocked 4 Berlare orders on 2026-08-06. Literal SQL has no\n// positional coupling at all.\nfunction sqlLit(v) {\n  if (v === null || v === undefined || v === '') return 'NULL';\n  return \"'\" + String(v).replace(/'/g, \"''\") + \"'\";\n}\nfunction sqlNum(v) {\n  const n = Number(v);\n  return Number.isFinite(n) ? String(n) : 'NULL';\n}\nfunction buildDlqSql(queueName, msgId, p) {\n  const errJson = JSON.stringify({\n    message: p?.last_error?.message ?? 'max retries exceeded',\n    kind: p?.last_error?.kind ?? null,\n    stage: 'retry_ladder',\n    http_status: p?.last_error?.http_status ?? null,\n    classification: p?.last_error?.classification ?? null,\n  });\n  return 'WITH archived AS (SELECT public.pgmq_archive_order(' + sqlLit(queueName) + '::text, ' + sqlNum(msgId) + '::bigint) AS ok) '\n    + 'INSERT INTO public.dlq_alerts (queue_name, msg_id, canonical_order_id, external_ref, source, location_key, last_error, attempt_count, raw_payload_id) '\n    + 'SELECT ' + sqlLit(queueName) + ', ' + sqlNum(msgId) + ', '\n    + sqlLit(p?.canonical_order_id) + '::uuid, '\n    + sqlLit(p?.external_ref) + ', '\n    + sqlLit(p?.source) + '::public.order_source, '\n    + sqlLit(p?.location_key) + ', '\n    + sqlLit(errJson) + '::jsonb, '\n    + sqlNum(p?.attempt_count ?? 0) + ', '\n    + sqlNum(p?.raw_payload_id) + '::bigint '\n    + 'FROM archived ON CONFLICT (queue_name, msg_id) DO NOTHING RETURNING id';\n}\n\n// SAFETY NET: kalau attempt_count > 2x maxAttempts, force archive (mencegah runaway loop seperti k6 incident 1 Mei 2026)\nif (Number(envelope.attempt_count ?? 0) > 2 * maxAttempts) {\n  const p = { canonical_order_id: envelope.payload?.canonical_order_id ?? null, external_ref: envelope.payload?.external_ref ?? null, source: envelope.payload?.source ?? null, location_key: envelope.payload?.location_key ?? null, raw_payload_id: envelope.raw_payload_id ?? null, attempt_count: attempt, last_error: { message: 'force_archived: attempt_count exceeded 2x max_attempts', kind: 'runaway' } };\n  return [{ json: { outcome: 'archived_to_dlq', queue_name: envelope.queue_name, msg_id: envelope.msg_id, attempt_count: attempt, next_vt_seconds: null, classification: { retryable: false, reason: 'force_archived_runaway' }, dlq_payload: p, dlq_sql: buildDlqSql(envelope.queue_name, envelope.msg_id, p), correlation_id: envelope.correlation_id } }];\n}\n\nconst failed = proc.ok === false || proc.error !== undefined;\nlet errorCtx = null;\nif (failed) {\n  if (proc.error) {\n    errorCtx = { http_status: proc.error.status ?? proc.error.httpCode ?? proc.error.http_status ?? null, headers: proc.error.headers ?? {}, kind: proc.error.code === 'ETIMEDOUT' ? 'timeout' : (proc.error.kind ?? 'network'), message: proc.error.message ?? 'unknown' };\n  } else {\n    errorCtx = { http_status: proc.http_status ?? null, headers: proc.headers ?? {}, kind: proc.kind ?? null, message: proc.message ?? 'processor returned ok:false' };\n  }\n}\n\nfunction classify(ctx) {\n  if (!ctx) return null;\n  if (ctx.kind === 'timeout') return { retryable: true,  reason: 'timeout' };\n  if (ctx.kind === 'network') return { retryable: true,  reason: 'network' };\n  const s = ctx.http_status;\n  if (s == null)             return { retryable: true,  reason: 'network' };\n  if (s >= 500 && s <= 599)  return { retryable: true,  reason: 'server_error' };\n  if (s === 429) {\n    const ra = ctx.headers ? (ctx.headers['retry-after'] ?? ctx.headers['Retry-After']) : null;\n    let retry_after_ms = null;\n    if (ra != null && ra !== '') {\n      const n = Number(ra);\n      if (Number.isFinite(n)) retry_after_ms = Math.max(0, n * 1000);\n      else { const t = Date.parse(ra); if (Number.isFinite(t)) retry_after_ms = Math.max(0, t - Date.now()); }\n    }\n    return { retryable: true, reason: 'rate_limited', retry_after_ms };\n  }\n  if (s === 401)             return { retryable: true,  reason: 'auth', refresh_token_first: true };\n  if (s === 400)             return { retryable: false, reason: 'bad_payload' };\n  if (s === 403)             return { retryable: false, reason: 'forbidden' };\n  if (s === 409)             return { retryable: false, reason: 'duplicate' };\n  return { retryable: false, reason: 'unknown' };\n}\n\nfunction nextVisibilityTimeout(att, lad, jr) {\n  const idx = Math.min(Math.max(att, 1), lad.length) - 1;\n  const base = lad[idx];\n  const jitter = (Math.random() * 2 - 1) * jr;\n  return Math.max(1, Math.round(base * (1 + jitter)));\n}\n\nlet outcome, next_vt_seconds = null, dlq_payload = null, classification = null;\n\nif (!failed) {\n  outcome = 'success';\n} else {\n  classification = classify(errorCtx);\n  const exhausted = attempt >= maxAttempts;\n  if (!classification.retryable || exhausted) {\n    outcome = 'archived_to_dlq';\n    dlq_payload = { canonical_order_id: envelope.payload?.canonical_order_id ?? null, external_ref: envelope.payload?.external_ref ?? null, source: envelope.payload?.source ?? null, location_key: envelope.payload?.location_key ?? null, raw_payload_id: envelope.raw_payload_id ?? null, attempt_count: attempt, last_error: { ...errorCtx, classification } };\n  } else {\n    outcome = 'retry_scheduled';\n    if (classification.reason === 'rate_limited' && classification.retry_after_ms != null) {\n      next_vt_seconds = Math.max(1, Math.ceil(classification.retry_after_ms / 1000));\n    } else {\n      next_vt_seconds = nextVisibilityTimeout(attempt, ladder, jitterRatio);\n    }\n  }\n}\n\nreturn [{ json: { outcome, queue_name: envelope.queue_name, msg_id: envelope.msg_id, attempt_count: attempt + (outcome === 'retry_scheduled' ? 1 : 0), next_vt_seconds, classification, dlq_payload, dlq_sql: dlq_payload ? buildDlqSql(envelope.queue_name, envelope.msg_id, dlq_payload) : null, correlation_id: envelope.correlation_id } }];\n"
+   },
+   "typeVersion": 2
+  },
+  {
+   "id": "switch-outcome",
+   "name": "Route by Outcome",
+   "type": "n8n-nodes-base.switch",
+   "position": [
+    1080,
+    300
+   ],
+   "parameters": {
+    "rules": {
+     "values": [
+      {
+       "outputKey": "success",
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "typeValidation": "strict"
+        },
+        "combinator": "and",
+        "conditions": [
+         {
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          },
+          "leftValue": "={{ $json.outcome }}",
+          "rightValue": "success"
+         }
+        ]
+       }
+      },
+      {
+       "outputKey": "retry",
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "typeValidation": "strict"
+        },
+        "combinator": "and",
+        "conditions": [
+         {
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          },
+          "leftValue": "={{ $json.outcome }}",
+          "rightValue": "retry_scheduled"
+         }
+        ]
+       }
+      },
+      {
+       "outputKey": "dlq",
+       "conditions": {
+        "options": {
+         "caseSensitive": true,
+         "typeValidation": "strict"
+        },
+        "combinator": "and",
+        "conditions": [
+         {
+          "operator": {
+           "type": "string",
+           "operation": "equals"
+          },
+          "leftValue": "={{ $json.outcome }}",
+          "rightValue": "archived_to_dlq"
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "options": {
+     "fallbackOutput": "none"
+    }
+   },
+   "typeVersion": 3
+  },
+  {
+   "id": "pgmq-delete",
+   "name": "pgmq.delete (success)",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1320,
+    180
+   ],
+   "parameters": {
+    "query": "SELECT public.pgmq_delete_order($1::text, $2::bigint) AS deleted",
+    "options": {
+     "queryReplacement": "={{ $json.queue_name }},={{ $json.msg_id }}"
+    },
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "pgmq-set-vt",
+   "name": "pgmq.set_vt (retry)",
+   "type": "n8n-nodes-base.postgres",
+   "notes": "RULES \u00a711 \u2014 retries via visibility timeout, NEVER setTimeout.",
+   "position": [
+    1320,
+    300
+   ],
+   "parameters": {
+    "query": "SELECT public.pgmq_set_vt_order($1::text, $2::bigint, $3::int) AS new_vt",
+    "options": {
+     "queryReplacement": "={{ $json.queue_name }},={{ $json.msg_id }},={{ $json.next_vt_seconds }}"
+    },
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "pgmq-archive",
+   "name": "pgmq.archive + dlq_alerts insert",
+   "type": "n8n-nodes-base.postgres",
+   "position": [
+    1320,
+    420
+   ],
+   "parameters": {
+    "query": "={{ $json.dlq_sql }}",
+    "options": {},
+    "operation": "executeQuery"
+   },
+   "credentials": {
+    "postgres": {
+     "id": "9zc3jzWzgtSSJL0O",
+     "name": "Postgres Data Catalog"
+    }
+   },
+   "typeVersion": 2.5
+  },
+  {
+   "id": "build-processor-input",
+   "name": "Build Processor Input",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    530,
+    220
+   ],
+   "parameters": {
+    "jsCode": "// Pass the envelope's payload as the sub-workflow input. n8n executeWorkflow\n// otherwise forwards the most recent item ($json from Load Retry Policy), so\n// the processor would never see raw_id / external_ref etc.\nreturn [{ json: $('When Called by Another Workflow').first().json.payload }];\n"
+   },
+   "typeVersion": 2
+  }
+ ]
+}
