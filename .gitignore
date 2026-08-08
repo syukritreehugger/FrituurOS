@@ -17,3 +17,8 @@ node_modules
 .worktrees/
 test-results/
 playwright-report/
+
+# Minified vendor bundles: single lines of 500KB+ crash editors/indexers/WSL.
+# Keep them on the VPS or in git history, never in the working tree.
+docs/API Docs/takeaway-portal-bundle/index-*.js
+docs/API Docs/takeaway-portal-bundle/index-*.md
