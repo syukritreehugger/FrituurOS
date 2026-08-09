@@ -1,6 +1,6 @@
 # Takeaway.com (Just Eat Takeaway) — Order Acceptance Contract
 
-**Status:** derived and cross-verified 2026-08-09. **Not yet confirmed by a live order** — no JET order has
+**Status:** derived, cross-verified and **independently re-verified line-by-line against the bundle on 2026-08-09** (see §2.3). **Not yet confirmed by a live order** — no JET order has
 passed through `confirm-order` since the fix was deployed (stores were closed). Tomorrow's first order is the
 real test; see §7.
 
@@ -125,6 +125,61 @@ Reading the durations as **minutes**:
 4. F6X633's round `18:15:00` is a **post-acceptance** override by staff (they cannot set it while `new`), not
    evidence that an explicit time is sent at accept.
 
+### 2.3 Independent re-verification log (2026-08-09)
+
+Every claim below was re-checked directly against the bundle, one at a time, quoting the exact substring.
+Nothing here rests on a summary of a summary.
+
+| # | Claim | Result |
+|---|---|---|
+| 1 | `can_change_confirmed_time_of_order(t){return this.is_own_delivery&&!t.is_cancelled&&!t.is_delivered&&!t.is_new}` | ✅ verbatim, 1 occurrence |
+| 2 | `can_change_delivery_duration_of_order(t){return !this.is_courier_first&&this.is_own_delivery&&t.is_delivery}` | ✅ verbatim |
+| 3 | baseURL `fr.apiUrl` = `"https://live-orders-api.takeaway.com/api"` | ✅ **identical to ours** |
+| 4 | `Hn=Dn.create({baseURL:fr.apiUrl,headers:{...}})` + request interceptor | ✅ verbatim |
+| 5 | `G6e()` adds headers | ❌ **refuted** — `async function G6e(){return{}}`, an empty stub |
+| 6 | `Che()` reads `selectedRestaurantId` from storage; ids come from the token's `rids` claim | ✅ verbatim — but see §5.1, our tokens carry no `rids` |
+| 7 | `Wpe` is a server transition validator | ❌ **refuted** — it is client-side stale-update suppression; see §3 |
+| 8 | `confirm-order` is the only accept path | ✅ exactly **1 occurrence** in 2.6 MB; no bulk/alternative accept exists |
+
+**Bonus facts surfaced during verification:**
+
+```js
+// delivery_service is an enum on the restaurant model
+get is_own_delivery(){return this.delivery_service==="own_delivery"}
+get is_scoober(){return this.delivery_service==="scoober"}   // also: is_3PL, is_delco, is_haal
+// the cooking duration can ALSO be locked, for courier-first platform-delivery restaurants:
+can_change_cooking_duration_of_order(t){return!((this.is_3PL||this.is_scoober||this.is_delco||this.is_haal)&&this.is_courier_first&&t.is_delivery)}
+```
+
+```js
+const fr = { env:"production",
+  apiUrl:"https://live-orders-api.takeaway.com/api",
+  liveOrdersUrl:"https://live-orders.takeaway.com/",
+  courierAppUrl:"https://courierapp.takeaway.com/",
+  socketHost:"https://live-orders-socket.takeaway.com", fcmV… }
+```
+
+Additional endpoints seen: `POST /devices/create`, `DELETE /devices/{id}` (push registration),
+`POST {apiUrl}/logs` (client telemetry), `POST /account/actualize` (session keep-alive).
+
+### 2.4 Our restaurants are `own_delivery` (evidenced)
+
+`delivery_service` is a **restaurant-level** field (from `GET /restaurant`), so it never appears in order
+payloads — but the order payloads settle the question anyway:
+
+| Location | JET orders (7 d) | orders carrying a JET courier |
+|---|---|---|
+| LOC_AALST | 111 | **0** |
+| LOC_BERLARE | 38 | **0** |
+| LOC_DENDER | 34 | **0** |
+
+183 orders, `couriers: []` on every single one. A `scoober` / 3PL restaurant would have JET couriers assigned;
+ours never do — the stores deliver themselves (via Shipday). Combined with the predicates above this means:
+
+- `can_change_delivery_duration_of_order` is **true** for our delivery orders → sending `25` is legitimate.
+- `can_change_confirmed_time_of_order` is still **false while the order is `new`** → `estimated_delivery_time`
+  must be `null` at accept. Both of our payload decisions hold.
+
 ---
 
 ## 3. Order status — what is actually known
@@ -233,11 +288,25 @@ Hn.interceptors.request.use(async e=>{ const t=await c7(), n=await Che(), r=u7()
 | `X-Tenant` | `u7()`; returns `default` for takeaway.com → **not sent** | ❌ correct to omit |
 | (`G6e()`) | resolved: **a stub returning `{}`** — contributes nothing | — |
 
-**On `X-Restaurant-Id`:** the portal sends it on every request because one login can manage several
-restaurants. Our JET credentials are per-location (a separate account per store), and our `GET /orders`
-polling works without it. Sending a *wrong* id is more dangerous than omitting it, and we have no verified
-source for the value. **If the first live accept returns 403, this is candidate #1** — source the id from
-`GET /restaurant` and retry.
+**On `X-Restaurant-Id` — verified inapplicable, not a gap.** The portal sends it because one login can manage
+several restaurants: the id list comes from the token's **`rids`** claim
+(`vn.tokenParsed.rids ?? (await vn.loadUserInfo()).rids`), the operator picks one, and `Che()` reads that
+choice back from `sessionStorage`/`localStorage`.
+
+Our tokens are structurally different — decoded from `takeaway_tokens`:
+
+```json
+{ "atyp": "restaurant", "aid": "8218856", "preferred_username": "defrietbooster",
+  "email": "marketing@defrietbooster.be", "realm_access": { "roles": ["restaurant-admin"] } }
+```
+
+**No `rids` claim at all** — instead a single `aid` (account id) per token: Berlare `8218856`,
+Dender `8350673`. Each of our credentials *is* one restaurant, so there is nothing to select and no
+multi-restaurant ambiguity for the server to resolve. Our `GET /orders` polling has always worked without the
+header, which is consistent.
+
+**Fallback if a live accept ever returns 403 with `confirmed_at` still null:** try
+`X-Restaurant-Id: <aid from that location's token>` as the first experiment.
 
 There is **no response interceptor and no retry config**; axios timeout is the default (unlimited) — we set
 10 s ourselves.
@@ -313,7 +382,7 @@ and — **only when the fetched order status was `new`** — writes a `dlq_alert
 
 | Item | Status |
 |---|---|
-| `X-Restaurant-Id` | not sent — see §5.1. Candidate #1 if the first accept 403s |
+| `X-Restaurant-Id` | not sent — **verified inapplicable** (§5.1): our tokens are single-restaurant (`aid`, no `rids`). Fallback experiment if a 403 appears |
 | Hardcoded `15` / `25` | acceptable for now (matches what staff used on C4JFFV/YFTJK3/TVRWQ6) but these set the **customer's promised time**; move to `dim_location` when there is time (staff also used 10/15 and 10/35) |
 | Pickup `null` | **unverified** — zero pickup rows exist. If a pickup order 422s, try `0` |
 | Preorder | **unverified** — zero preorder rows. Watch whether JET anchors the ETA to `requested_time` |
