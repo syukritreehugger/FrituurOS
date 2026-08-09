@@ -345,12 +345,139 @@ order is `confirmed`). On timeout: alert, do not retry.
 | GET | `/orders/history/export/{exportType}` | export |
 | POST | `/orders/{id}/confirm-order` | **accept** |
 | PATCH | `/orders/{id}` | status transition after acceptance |
-| POST | `/orders/{id}/issue-status` | report an order issue |
+| POST | `/orders/{id}/issue-status` | report an order issue (`partner_product_id_list`, `menu_product_id_list`) |
+| GET | `/orders/{id}/receipt?translation=&phone_masking_enabled=` | rendered receipt (string) |
+| GET | `/orders/{id}/esc-pos-receipt?translation=&line_character_length=` | **raw ESC/POS bytes** (`number[]`); `line_character_length=48` for the large receipt |
 | GET | `/restaurant` | restaurant settings (PIN state, order_flow, delivery_service) |
-| PATCH | `/restaurant/setting/{key}` | change a setting |
+| PATCH | `/restaurant/setting/{general\|ui\|receipt}` | change a setting — body `{ name, value }` |
+| POST | `/restaurant/update-status` | open/close the restaurant — body `{ action }` |
+| POST | `/restaurant/worktime/slot` | temporary closure — body `{ type: all\|delivery\|pickup, reason, duration }` |
+| DELETE | `/restaurant/worktime/{slotId}` | reopen (delete the closure slot) |
 | POST | `/account/actualize` | session keep-alive |
 
+Source: `src/shared/api/orders.ts`, `src/shared/api/restaurants.ts` (recovered from `sourcesContent`).
+
 A second axios instance (`x7`) targets JET's "smart gateway" on a different host — unrelated to orders.
+
+### 5.4 The durations are a *restaurant setting*, not a magic number
+
+`restaurants.ts` types the general-settings PATCH as:
+
+```ts
+updateSettingApi('general', 'food_preparation_duration' | 'average_delivery_duration', value)
+```
+
+and `RestaurantModel` carries both as required numbers:
+
+```ts
+readonly food_preparation_duration!: number;
+readonly average_delivery_duration!: number;
+```
+
+So the two values Srova hardcodes as `15` / `25` are exactly the fields the restaurant configures for itself
+and `GET /restaurant` returns them. **The correct long-term source is `GET /restaurant`, not a constant and
+not `dim_location`** — that keeps Srova's promised time identical to what the tablet would have promised.
+
+`constants.ts` bounds what the UI will ever submit:
+
+```ts
+export const MIN_DEFAULT_TIME = 5;
+export const MAX_DEFAULT_TIME = 50;
+```
+
+Our `15` / `25` sit inside `[5, 50]`, so they cannot be rejected as out-of-range.
+
+**Wire format of the third field** (`orders.ts`) — ISO-8601 truncated to whole seconds, always `Z`:
+
+```js
+params.estimatedDeliveryTime ? params.estimatedDeliveryTime.toISOString().split('.')[0] + 'Z' : null
+```
+
+i.e. `2026-08-09T18:30:00Z` — **never** with milliseconds. Srova sends `null`, but if we ever anchor a
+preorder ETA (§ gaps) it must be emitted in this exact shape. The same truncation is used on
+`/orders/history` date bounds.
+
+### 5.5 The portal is push-driven; Srova is poll-driven
+
+The tablet does not poll for new orders. `src/shared/services/sockets/` sets up **Laravel Echo over
+socket.io**:
+
+| | |
+|---|---|
+| Host | `https://live-orders-socket.takeaway.com` (from the inlined build env; API is `https://live-orders-api.takeaway.com/api`) |
+| Transport | `['websocket']` only, `namespace: ''`, `reconnection: false` (handled manually) |
+| Auth headers | `Authorization: Bearer <token>`, **`X-Restaurant-Id: <restaurant.reference>`**, plus `X-Tenant` when the tenant is not `default`/`internal` |
+| Channel | `private-restaurant.{reference}.orders` |
+| Events | `OrderCreatedEvent`, `OrderUpdatedEvent` (also `.menu`, `.notifications`, `.receipt-settings`, and the bare restaurant channel) |
+| Reconnect | fresh token on every reconnect; 5 consecutive `connect_error` or `subscription_error` → hard failure toast; random 3–10 s backoff on `disconnect` |
+
+Two consequences:
+
+1. **`X-Restaurant-Id` is real** — it is just scoped to the *socket auth handshake*, not the REST calls
+   (§5.1 remains correct for REST).
+2. **Latency gap.** The tablet learns about an order the instant it is created; Srova learns about it on the
+   next poll tick. Every second of that gap is a second the tablet alarm is ringing (§4) and the accept clock
+   is running. Subscribing to this channel instead of (or alongside) polling is the single biggest available
+   improvement to JET acceptance latency — logged as a standing item in §8, not attempted yet.
+
+### 5.6 Retry policy the portal itself uses
+
+```js
+if (message?.includes('Error while reading line from the server')) return true;  // known server bug, always retry
+if (error instanceof CanceledError) return false;
+return status !== 403 && failureCount < 2;
+```
+
+**Never retry a 403** (that is where `pin_required` and `Wrong status transition!` live) and cap everything
+else at two attempts. Srova's accept path already never blind-retries; this is the upstream confirmation.
+
+### 5.7 Authoritative `OrderData` shape
+
+`src/shared/factories/order.ts` builds a fully-populated fixture, which pins down every field name and type
+the API returns — the closest thing to a schema that survives compilation (the `types/` directory is
+type-only and was erased at build time; only `trainings.ts` survived).
+
+**Money** — all euros as decimals, not cents:
+`subtotal`, `delivery_fee`, `service_fee`, `small_order_fee`, `discounts_total`, `stampcards_total`,
+`restaurant_total`, `customer_total`, `currency`.
+
+> `restaurant_total` ≠ `customer_total`. The former is what the restaurant is settled; the latter is what the
+> customer paid. Any POS reconciliation must use **`customer_total`**, and note that `delivery_fee`,
+> `service_fee` and `small_order_fee` are *separate line values*, not folded into `subtotal` — the same class
+> of gap that caused the Lightspeed "-€3.00 unpaid / won't print" bug on the Shopify side.
+
+**Customer** — note `street` and `street_number` are **separate fields**:
+`full_name`, `street`, `street_number`, `postcode`, `city`, `phone_number`, `display_phone_number`,
+`phone_masking_code`, `company_name`, `extra: string[]` (free-form lines such as `"floor: 123"`).
+
+> `extra[]` is customer-entered delivery detail (floor, doorbell, instructions). Dropping it loses information
+> the driver needs. Given the LS ticket only renders `deliveryStreet` as one line
+> (`[[ls-ticket-rendering-rules]]`), `street` + `street_number` must be joined by us, and `extra[]` belongs in
+> the order note.
+
+**Timing / status**: `placed_date`, `requested_time`, `restaurant_estimated_pickup_time`,
+`restaurant_estimated_delivery_time`, `delivery_service_pickup_time`, `delivery_service_delivery_time`,
+`cancelled_at`. All of these are parsed by `transformEntityTimeToDateObjects`, which accepts both
+`yyyy-mm-ddTHH:mm:ssZ` and a legacy space-separated form with no timezone (assumed UTC) — so **treat any
+JET timestamp without an explicit offset as UTC**.
+
+`OrderModel` exposes the ETA as `delivery_service_delivery_time || restaurant_estimated_delivery_time`, and
+comments `restaurant_estimated_delivery_time` as *"filled when just eat order arrives"*.
+
+**Other**: `id` (numeric, the `detail_id` we POST to), `public_reference` (the human `#XXXXXX`), `global_id`,
+`status`, `delivery_type`, `payment_type`, `remarks`, `products[]`, `couriers[]`, `with_alcohol`,
+`has_failure_alert`.
+
+#### Verified against production (2026-08-09, 2 017 `raw_orders` rows, `source = 'takeaway'`)
+
+| Field | Srova's handling | Verdict |
+|---|---|---|
+| `street` + `street_number` | joined into `customer.address.line1` | ✅ correct, incl. alphanumeric numbers (`"Gentsesteenweg"` + `"203B"` → `"Gentsesteenweg 203B"`) |
+| `phone_number` vs `display_phone_number` | we store `phone_number` | ✅ correct — `display_phone_number` is JET's **masking proxy** and was the *same number* (`+32460260118`) for every customer. Pushing it to LS/Shipday would leave drivers unable to reach anyone |
+| `remarks` | → `customer.notes` | ✅ preserved (265 orders have remarks, e.g. `"Niet aanbellen a.u.b."`) |
+| `customer_total` | → `payment.total_cents` | ✅ matches (36.30 → 3630). **Latent ambiguity:** every order to date has `subtotal == customer_total == restaurant_total` and all three fee fields `0`, so the data cannot distinguish which field the normalizer actually reads. If JET ever starts charging a `delivery_fee`/`service_fee`, this is the first thing to re-check — it is the same shape as the Lightspeed "−€3.00 unpaid, won't print" bug |
+| `company_name` | not mapped | ⚪ never populated (0 / 2 017) |
+| `extra[]` | inconsistent | ⚠️ **low-impact defect.** Only 6 / 2 017 orders (0.3 %) populate it. In 5 the floor/bus text is already inside `street_number` (`"53/001"`, `"79/004"`, `"12 bus 21"`) so dropping it is harmless; one (`BWJ7VF`) copied it to `line2`, producing a duplicated ticket line. Exactly one order (`K78T7X`, `extra: ["Floor: bus 2"]`, `line1: "Ouden Aardeweg 2"`) **lost real delivery detail** — 0.05 % of orders. Fix when convenient: append `extra[]` to `customer.notes` only when its text is not already a substring of `line1` |
 
 ---
 
@@ -383,7 +510,7 @@ and — **only when the fetched order status was `new`** — writes a `dlq_alert
 | Item | Status |
 |---|---|
 | `X-Restaurant-Id` | not sent — **verified inapplicable** (§5.1): our tokens are single-restaurant (`aid`, no `rids`). Fallback experiment if a 403 appears |
-| Hardcoded `15` / `25` | acceptable for now (matches what staff used on C4JFFV/YFTJK3/TVRWQ6) but these set the **customer's promised time**; move to `dim_location` when there is time (staff also used 10/15 and 10/35) |
+| Hardcoded `15` / `25` | acceptable for now (matches what staff used on C4JFFV/YFTJK3/TVRWQ6; both inside JET's own `[MIN_DEFAULT_TIME=5, MAX_DEFAULT_TIME=50]` bounds) but these set the **customer's promised time**. §5.4 supersedes the earlier "move to `dim_location`" plan: the authoritative source is `GET /restaurant` → `food_preparation_duration` / `average_delivery_duration`, the restaurant's own configured defaults |
 | Pickup `null` | **unverified** — zero pickup rows exist. If a pickup order 422s, try `0` |
 | Preorder | **unverified** — zero preorder rows. Watch whether JET anchors the ETA to `requested_time` |
 | Token refresh timing | JET access tokens last ~5 min; we load the token at the top of the workflow. If a 401 appears, refresh immediately before the accept node |
@@ -455,7 +582,13 @@ are unverified.
 2. The bundle hash is a canary for **client** changes only — it would *not* have caught the 2026-08-07
    server-side tightening. **The `takeaway_accept` alarm is the real canary. Keep it healthy above all else.**
 3. Server behaviour may vary per location or `delivery_service`; verify each store separately.
-4. `15` / `25` set the customer's promised time. Move to `dim_location` rather than editing the node.
+4. `15` / `25` set the customer's promised time. Read them from `GET /restaurant` (§5.4) rather than editing
+   the node.
+5. **Polling latency (open item).** The tablet is push-driven over a socket.io channel (§5.5); Srova polls.
+   Until we either subscribe to `private-restaurant.{reference}.orders` or shorten the poll interval, worst-case
+   time-to-accept is one full poll tick — during which the tablet alarm is ringing at the counter. Subscribing
+   uses the same bearer token plus `X-Restaurant-Id`, so it is credential-compatible with what we already have;
+   the cost is running a persistent socket client outside n8n.
 
 ---
 

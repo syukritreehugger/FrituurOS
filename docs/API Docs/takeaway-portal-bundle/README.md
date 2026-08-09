@@ -75,7 +75,13 @@ JET's own files (the rest are `node_modules`); 156 of those are text and are ext
 | `order/showOrderUpdateNotification.ts`, `differenceInObjects.ts` | which field changes trigger a re-render/notification |
 | `services/sockets/listeners/` | `orderCreatedListener`, `orderUpdateListener` — the websocket push path |
 
-## The five findings that actually changed our implementation
+## The findings that actually changed our implementation
+
+Findings 1–5 come from the first two dissection passes; 6–9 from pass 3 (2026-08-09), which covered
+`api/restaurants.ts`, `services/sockets/*`, `services/query/queryClient.ts`, `factories/order.ts`,
+`helpers/transformEntityTimeToDateObjects.ts`, `hooks/useRestaurantStatus.ts` and `constants.ts`. The
+remaining unread files are UI components, Snowplow analytics and the training centre — no integration
+surface.
 
 ### 1. Accepting an order — the real signature
 
@@ -181,6 +187,39 @@ The function name says it: it decides whether an **incoming update** is older th
 socket/poll merging. An earlier draft of our contract mistook this for JET's server-side transition rule —
 `ORDER_STATUSES_SEQUENCE` is display/merge ordering, and `cancelled` sits last in it. **JET's server rule
 remains unknown**; what production proves is that a `new` order cannot be moved by `PATCH` at all.
+
+### 6. The durations are the restaurant's own setting (pass 3)
+
+`api/restaurants.ts` types the general-settings PATCH as
+`'food_preparation_duration' | 'average_delivery_duration'`, and `RestaurantModel` carries both as required
+numbers. The `15` / `25` we hardcode are literally those two settings — `GET /restaurant` returns the
+restaurant's configured values, which is the correct source. `constants.ts` bounds them at
+`MIN_DEFAULT_TIME = 5` / `MAX_DEFAULT_TIME = 50`, so our values cannot be out-of-range.
+
+`confirmOrderApi` also pins the wire format of the third field: ISO truncated to whole seconds plus `Z`
+(`.toISOString().split('.')[0] + 'Z'`) — never milliseconds.
+
+### 7. The portal is push-driven, not poll-driven (pass 3)
+
+`services/sockets/` is Laravel Echo over socket.io against `https://live-orders-socket.takeaway.com`
+(websocket transport only), subscribing to `private-restaurant.{reference}.orders` for `OrderCreatedEvent` /
+`OrderUpdatedEvent`. Auth handshake headers are `Authorization: Bearer …` **plus `X-Restaurant-Id`** — so that
+header is real, it is simply scoped to the socket handshake rather than the REST calls. This is the biggest
+open improvement to our accept latency; see §5.5 and §8.5 of the contract doc.
+
+### 8. Two 403 sub-reasons worth alarming on separately (pass 3)
+
+`services/query/queryClient.ts` branches 403 into `reason === 'pin_required'` (a PIN gate that will block our
+POST) and `message === 'Wrong status transition!'` (treated as a stale view — the portal refetches rather than
+erroring). Its retry rule: **never retry a 403**, cap others at two attempts, and always retry the known
+server bug `"Error while reading line from the server"`.
+
+### 9. `factories/order.ts` is the de-facto schema (pass 3)
+
+The `types/` directory is type-only and was erased at build time (only `trainings.ts` survived), but the test
+factory builds a fully-populated `OrderData`, pinning every field name. Notably `restaurant_total` vs
+`customer_total`, the three separate fee fields, and `customer.street_number` / `customer.extra[]`. Field-by-
+field reconciliation against 2 017 production rows is in §5.7 of the contract doc.
 
 ## Header contract — `axiosSetup.ts`, verbatim
 
