@@ -1,7 +1,14 @@
 # JET live-orders portal — complete vendored bundle + original sources
 
-Everything the Just Eat Takeaway **restaurant portal** (`https://live-orders.takeaway.com`) serves, captured
-2026-08-09, plus its **original TypeScript sources** recovered from the public sourcemap.
+Everything the Just Eat Takeaway **restaurant portal** (`https://live-orders.takeaway.com`) serves — the
+entry chunk **and all 11 lazily-loaded route chunks** — captured 2026-08-09, plus its **original TypeScript
+sources** recovered from the public sourcemaps.
+
+> **History of this capture.** The first capture (2026-08-08/09) took only the entry chunk that `index.html`
+> references. That is the app shell; every route (`Orders`, `Settings`, `Menu`, `OrderHistory`, `Receipt`) is
+> a separate Vite chunk fetched at runtime, so the entire order-acceptance UI was missing — which is why
+> `confirmOrderApi` appeared to have no callers. The lazy chunks were added on 2026-08-09 (pass 4) and
+> immediately overturned a documented conclusion about pickup orders (finding 10).
 
 We are not a certified JET partner and have no official API documentation. This directory *is* our
 documentation: what the portal itself does is the de-facto contract. It is the evidence behind
@@ -11,12 +18,13 @@ documentation: what the portal itself does is the de-facto contract. It is the e
 
 | Path | What | Size | Safe to open? |
 |---|---|---|---|
-| `src/` | **156 original TypeScript/TSX source files** recovered from the sourcemap | 322 KB | ✅ yes — normal code, longest line 1 377 chars |
+| `src/` | **310 original TypeScript/TSX source files** recovered from the sourcemaps | 1.2 MB | ✅ yes — normal code |
 | `index.html` | portal entry document | 7 KB | ✅ |
 | `manifest.json` | PWA manifest | 2 KB | ✅ |
 | `style-Hww_4wf0.css` | stylesheet, re-wrapped to 1 651 lines | 188 KB | ✅ |
 | `raw/index-D_IofYHW.js.gz` | the shipped minified bundle | 821 KB gz (2.6 MB raw) | ⚠️ gzipped on purpose |
 | `raw/index-D_IofYHW.js.map.gz` | the sourcemap `src/` came from | 2.3 MB gz (9.9 MB raw) | ⚠️ gzipped on purpose |
+| `raw/<Route>-<hash>.js{,.map}.gz` | the 11 lazy route chunks + their sourcemaps | 532 KB gz total | ⚠️ gzipped on purpose |
 
 **Read `src/` — not `raw/`.** The two files in `raw/` are single lines of 631 KB and 9.9 MB. Opening either
 one in an editor, a search indexer or an AI agent's context loads that whole line at once; during this
@@ -38,9 +46,18 @@ grep -oE '.{0,200}confirm-order.{0,300}' /tmp/jet_bundle.js | head -c 3000
 | Bundle | `/assets/index-D_IofYHW.js` — 2 667 175 bytes, md5 `f50adeba380d155b2612ad6cb616e639` |
 | Sourcemap | `/assets/index-D_IofYHW.js.map` — 9 882 143 bytes, **publicly served** |
 | Retrieved | 2026-08-08 (bundle) / 2026-08-09 (full capture incl. sourcemap) |
+| Lazy chunks | `Orders-CGV6Cr5n`, `OrderHistory-BAz2XGI0`, `Settings-D5-UEG0v`, `Menu-BJaGjJXf`, `Receipt-D_xUyoA5`, `OrderListSettings-BXQYDJFO`, `useExtraActions-DXDEiCl1`, `usePinProtection-w42yvVmN`, `getOrderPaymentTitle-uSSGtShP`, `currency-CTs5O5Nt`, `TConnect-ulO2XI0W` — all `.js` + `.js.map`, all HTTP 200, retrieved 2026-08-09 |
 
-The sourcemap carries `sourcesContent`, i.e. the actual pre-minification source. Of its 1 057 entries, 177 are
-JET's own files (the rest are `node_modules`); 156 of those are text and are extracted into `src/`.
+The sourcemaps carry `sourcesContent`, i.e. the actual pre-minification source. The entry map yielded 156
+files; the 11 lazy maps yielded 155 more (some shared modules overlap and are deduplicated), giving the 310
+in `src/`.
+
+Chunk filenames are not in `index.html` — they are dynamic-import specifiers inside the entry bundle, and are
+recovered with:
+
+```bash
+zcat raw/index-D_IofYHW.js.gz | grep -oE 'assets/[A-Za-z0-9_-]+-[A-Za-z0-9_-]{8}\.js' | sort -u
+```
 
 ## Map of `src/` — where to look for what
 
@@ -77,11 +94,23 @@ JET's own files (the rest are `node_modules`); 156 of those are text and are ext
 
 ## The findings that actually changed our implementation
 
-Findings 1–5 come from the first two dissection passes; 6–9 from pass 3 (2026-08-09), which covered
-`api/restaurants.ts`, `services/sockets/*`, `services/query/queryClient.ts`, `factories/order.ts`,
-`helpers/transformEntityTimeToDateObjects.ts`, `hooks/useRestaurantStatus.ts` and `constants.ts`. The
-remaining unread files are UI components, Snowplow analytics and the training centre — no integration
-surface.
+Findings 1–5 come from the first two dissection passes; 6–9 from pass 3; **10 from pass 4**, which added the
+lazy route chunks.
+
+Pass 3 closed with the claim that *"the remaining unread files are UI components, Snowplow analytics and the
+training centre — no integration surface."* That was an inference from filenames, and it was wrong twice
+over: the entry chunk also held `api/mqttCredentials.ts`, `api/pin.ts`, `api/devices.ts`, `api/chains.ts` and
+`api/notifications.ts` (none of them read at the time), and the whole `Orders` route was not in the capture
+at all. Coverage is now established by sweep, not by inference:
+
+```bash
+# every file that touches the network
+grep -rlE "url: *[\`'\"]|axios\(|fetch\(" src/
+# every endpoint literal
+grep -rhoE "url: *[\`'][^\`']+[\`']" src/ | sed "s/url: *//" | sort -u
+# every file carrying order business logic
+grep -rlE "orderStatus\.|is_new|can_[a-z_]+|delivery_type|ORDER_STATUSES_SEQUENCE" src/
+```
 
 ### 1. Accepting an order — the real signature
 
@@ -110,9 +139,14 @@ export function confirmOrderApi(params: {
 }
 ```
 
-**All three values are declared `| null` in JET's own types.** That settles the nullability question that our
-production data could only hint at. Sending `null` for `delivery_time_duration` on a pickup order is
-type-correct, not a gamble.
+**All three values are declared `| null` in JET's own types.** That settles the *nullability* question that
+our production data could only hint at.
+
+> ⚠️ **Corrected by finding 10.** This section originally concluded that *"sending `null` for
+> `delivery_time_duration` on a pickup order is type-correct, not a gamble."* Type-correct it may be, but it
+> is **not what the portal does** — for pickup it sends `0`. A signature tells you what the server will
+> *accept*; only the caller tells you what it actually *receives*. The caller lives in the `Orders` chunk,
+> which this README did not cover until pass 4.
 
 `updateOrderStatusApi` (`PATCH /orders/{id}` `{status}`) is a *separate* function — it is not how you accept.
 
@@ -221,6 +255,29 @@ factory builds a fully-populated `OrderData`, pinning every field name. Notably 
 `customer_total`, the three separate fee fields, and `customer.street_number` / `customer.extra[]`. Field-by-
 field reconciliation against 2 017 production rows is in §5.7 of the contract doc.
 
+### 10. Pickup sends `0`, not `null` — and MQTT is not an order transport (pass 4)
+
+From `shared/hooks/useConfirmTakeawayOrder.ts`, the actual caller of `confirmOrderApi`:
+
+```ts
+const [cookingDuration, setCookingDuration] = useState(restaurant.food_preparation_duration);
+const [deliveryDuration, setDeliveryDuration] = useState(order.is_pickup ? 0 : restaurant.average_delivery_duration);
+```
+
+`OrderDetailsConfirmation.tsx` picks the scheme with `restaurant.is_just_eat`: takeaway.com restaurants (ours)
+send the two durations with `estimated_delivery_time: null`; just-eat.* restaurants send both durations `null`
+with an explicit `estimated_delivery_time`. The three fields are two schemes, never a free-form triple.
+
+**Srova currently sends `null` for pickup. That is a defect** — dormant only because no pickup order has ever
+arrived. See §5.8 of the contract doc.
+
+Also settled in this pass: the AWS IoT MQTT subsystem (`services/aws/`, `api/mqttCredentials.ts`) subscribes
+only to `partners/{country}/holidaysurveys`, `partners/{country}-{ref}/holidaysurveys` and a no-op
+`liveorders/{ref}/debug`. **Orders never travel over MQTT** — the earlier "smart gateway is unrelated to
+orders" note is now evidenced rather than assumed. And `useOrders.ts` has `staleTime: 24h` with **no
+`refetchInterval`**: the portal fetches `GET /orders` once and relies on the socket for everything after,
+so it is push-*exclusive*, not merely push-preferred.
+
 ## Header contract — `axiosSetup.ts`, verbatim
 
 ```ts
@@ -290,15 +347,26 @@ ssh vps-ghysels 'cd /tmp && rm -rf jetportal && mkdir jetportal && cd jetportal
   curl -s -A "$UA" https://live-orders.takeaway.com/ -o index.html
   SRC=$(grep -oE "/assets/index-[A-Za-z0-9_-]+\.js" index.html | head -1)
   curl -s -A "$UA" "https://live-orders.takeaway.com$SRC"     -o bundle.js
-  curl -s -A "$UA" "https://live-orders.takeaway.com$SRC.map" -o bundle.js.map'
+  curl -s -A "$UA" "https://live-orders.takeaway.com$SRC.map" -o bundle.js.map
+
+  # DO NOT STOP HERE. index.html references only the entry chunk; every route is a
+  # separate lazy chunk whose name appears only inside the entry bundle. Skipping
+  # this step is what hid the whole order-acceptance UI from passes 1-3.
+  for C in $(grep -oE "assets/[A-Za-z0-9_-]+-[A-Za-z0-9_-]{8}\.js" bundle.js | sort -u); do
+    curl -s -A "$UA" "https://live-orders.takeaway.com/$C"     -o "$(basename $C)"
+    curl -s -A "$UA" "https://live-orders.takeaway.com/$C.map" -o "$(basename $C).map"
+  done'
 ```
 
 Then extract the sources (this is how `src/` was produced):
 
 ```python
 import json, os, re
-m = json.load(open('bundle.js.map'))
-for s, c in zip(m['sources'], m['sourcesContent']):
+# run over EVERY *.js.map, not just bundle.js.map
+import glob
+for mf in sorted(glob.glob('*.js.map')):
+  m = json.load(open(mf))
+  for s, c in zip(m.get('sources', []), m.get('sourcesContent') or []):
     if 'node_modules' in s or c is None: continue
     if s.endswith(('.mp3', '.png', '.svg', '.ico', '.woff', '.woff2')): continue
     p = os.path.join('src', re.sub(r'^(\.\./)+', '', s))

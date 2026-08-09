@@ -32,9 +32,15 @@ X-Timezone: Europe/Brussels
 ```
 
 - `{order_id}` = the numeric `id` of the order detail object (**not** `public_reference`).
-- Durations are **integer minutes**. `delivery_time_duration` is **`null`** for pickup orders.
-- `estimated_delivery_time` is **always `null`** on the accept call — JET computes the ETA itself. All three
-  keys are always present; the portal never omits one. Never send the string `"null"`.
+- Durations are **integer minutes**, and the values should be the restaurant's own configured defaults —
+  `food_preparation_duration` / `average_delivery_duration` from `GET /restaurant` (§5.4).
+- `delivery_time_duration` is **`0`** for pickup orders — **not `null`** (§5.8; earlier drafts of this
+  document guessed `null` and were wrong).
+- `estimated_delivery_time` is **always `null`** on the accept call for a takeaway.com restaurant — JET
+  computes the ETA itself. All three keys are always present; the portal never omits one. Never send the
+  string `"null"`.
+- A **just-eat.\*** restaurant uses the mirror-image scheme (both durations `null`, an explicit
+  `estimated_delivery_time`). Ours are takeaway.com, so the scheme above is the correct one — see §5.8.
 
 **Do NOT use `PATCH /orders/{id} {"status": ...}` to accept.** That endpoint is for transitions *after*
 acceptance. On an order in `new` it returns, for every target status:
@@ -90,8 +96,15 @@ during acceptance. Therefore `e.estimatedDeliveryTime` is unset at that moment a
 can_change_delivery_duration_of_order(t){ return !this.is_courier_first && this.is_own_delivery && t.is_delivery }
 ```
 
-For a pickup order this predicate is false for every restaurant type, so the delivery-duration control is
-never rendered and the dialog has no value to send. `0` is a number the portal can never produce.
+For a pickup order this predicate is false for every restaurant type, so the delivery-duration **control is
+never rendered**.
+
+> ⚠️ **Superseded conclusion.** This paragraph previously continued: *"the dialog has no value to send. `0` is
+> a number the portal can never produce."* That inference was **wrong**. Hiding the stepper does not mean no
+> value is sent — the accept hook initialises the state to `0` for pickup and posts it regardless:
+> `useState(order.is_pickup ? 0 : restaurant.average_delivery_duration)` (§5.8). The correct pickup value is
+> **`0`**. Recorded here rather than deleted, because it is a good example of how reasoning from a *rendering*
+> predicate to a *wire* value fails.
 
 Date wire format helper: `.toISOString().split(".")[0] + "Z"` → **seconds precision, no milliseconds**,
 e.g. `2026-08-09T18:35:00Z`.
@@ -468,6 +481,64 @@ comments `restaurant_estimated_delivery_time` as *"filled when just eat order ar
 `status`, `delivery_type`, `payment_type`, `remarks`, `products[]`, `couriers[]`, `with_alcohol`,
 `has_failure_alert`.
 
+### 5.8 The accept UI itself — decisive (pass 4, 2026-08-09)
+
+Passes 1–3 read only the **entry chunk**. The order screen is a lazily-loaded chunk
+(`assets/Orders-CGV6Cr5n.js`) that had never been captured — which is why `confirmOrderApi` appeared to have
+no callers. It has now been fetched and extracted (§ "Refreshing this capture" in the bundle README). It
+settles three questions that were previously marked *unverified*.
+
+**Mode selection** — `OrderDetailsConfirmation.tsx`:
+
+```tsx
+{restaurant.is_just_eat ? <JustEatConfirmation … /> : <TakeawayConfirmation … />}
+```
+
+The three body fields are **two mutually exclusive schemes**, not one loose triple:
+
+| | takeaway.com (**ours**) | just-eat.* |
+|---|---|---|
+| `food_preparation_duration` | restaurant default, stepper ±5 | `null` |
+| `delivery_time_duration` | restaurant default, **`0` if pickup** | `null` |
+| `estimated_delivery_time` | `null` | an explicit `Date` |
+
+**Defaults** — `useConfirmTakeawayOrder.ts`, verbatim:
+
+```ts
+const STEP = 5;
+const MAX_ALLOWED_DURATION = 50;
+
+const [cookingDuration, setCookingDuration] = useState(restaurant.food_preparation_duration);
+const [deliveryDuration, setDeliveryDuration] = useState(order.is_pickup ? 0 : restaurant.average_delivery_duration);
+…
+mutation.mutate({ order, cookingTime: cookingDuration, deliveryDurationTime: deliveryDuration, estimatedDeliveryTime: null });
+```
+
+1. **Pickup sends `0`, not `null`.** Our workflow sends `null`. Zero pickup orders have reached us so far, so
+   this has never fired — but it is a live defect waiting for the first pickup order. **Fix before pickup is
+   enabled.**
+2. **The defaults are the restaurant settings**, confirming §5.4 from the calling side. `Settings/DefaultTimeSettings.tsx`
+   is the screen that edits them, stepping by 5 within `[MIN_DEFAULT_TIME, MAX_DEFAULT_TIME]`.
+3. **Preorders still send the plain defaults.** There *is* a clamp intended to shrink the durations when they
+   would overrun `requested_time`:
+
+   ```ts
+   const defaultValuesAreValid = order.requested_time &&
+       differenceInMinutes(order.requested_time,
+           restaurant.food_preparation_duration + restaurant.average_delivery_duration) >= 0;
+   if (order.is_preorder && !defaultValuesAreValid) { /* shrink to floor(minutes_until_preorder/2/5)*5 */ }
+   ```
+
+   but the second argument to `differenceInMinutes` is a **minute count, not a date** — date-fns reads it as
+   an epoch timestamp (~1970), so the difference is always hugely positive and `defaultValuesAreValid` is
+   always true. **The clamp is dead code in JET's own client**, and `valuesAreValid()` is defeated the same
+   way. In practice the portal sends the unmodified defaults for preorders too, which is what Srova already
+   does. Behaviour matched — but by coincidence, not design, so re-check it if JET ships a fix.
+
+`useConfirmOrderMutation.ts` adds no fields: it forwards `{id, cookingTime, deliveryDurationTime,
+estimatedDeliveryTime}` straight to `confirmOrderApi` and only emits analytics for how far the operator moved
+each stepper away from the restaurant default.
+
 #### Verified against production (2026-08-09, 2 017 `raw_orders` rows, `source = 'takeaway'`)
 
 | Field | Srova's handling | Verdict |
@@ -511,8 +582,8 @@ and — **only when the fetched order status was `new`** — writes a `dlq_alert
 |---|---|
 | `X-Restaurant-Id` | not sent — **verified inapplicable** (§5.1): our tokens are single-restaurant (`aid`, no `rids`). Fallback experiment if a 403 appears |
 | Hardcoded `15` / `25` | acceptable for now (matches what staff used on C4JFFV/YFTJK3/TVRWQ6; both inside JET's own `[MIN_DEFAULT_TIME=5, MAX_DEFAULT_TIME=50]` bounds) but these set the **customer's promised time**. §5.4 supersedes the earlier "move to `dim_location`" plan: the authoritative source is `GET /restaurant` → `food_preparation_duration` / `average_delivery_duration`, the restaurant's own configured defaults |
-| Pickup `null` | **unverified** — zero pickup rows exist. If a pickup order 422s, try `0` |
-| Preorder | **unverified** — zero preorder rows. Watch whether JET anchors the ETA to `requested_time` |
+| Pickup `null` | ❌ **DEFECT — resolved in doc, not yet in code.** §5.8 proves the portal sends **`0`** for pickup, not `null`. No pickup order has ever reached us, so it has never fired. Must be fixed before pickup is enabled on any store |
+| Preorder | ✅ **answered** (§5.8) — the portal sends the plain restaurant defaults for preorders too; its intended clamp is dead code due to a date-fns misuse in JET's own client. Srova's behaviour already matches |
 | Token refresh timing | JET access tokens last ~5 min; we load the token at the top of the workflow. If a 401 appears, refresh immediately before the accept node |
 | Alert gate | fires only when fetched status was `new`; consider inverting to "alert unless `confirmed_at` is now set" so an unreadable status cannot silently suppress an alert |
 
