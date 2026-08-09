@@ -1,8 +1,13 @@
 # Takeaway.com (Just Eat Takeaway) — Order Acceptance Contract
 
-**Status:** derived, cross-verified and **independently re-verified line-by-line against the bundle on 2026-08-09** (see §2.3). **Not yet confirmed by a live order** — no JET order has
-passed through `confirm-order` since the fix was deployed (stores were closed). Tomorrow's first order is the
-real test; see §7.
+**Status:** derived, cross-verified, **re-verified line-by-line against the bundle on 2026-08-09** (§2.3), and
+extended with JET's own accept UI recovered from the lazy `Orders` chunk the same day (§5.8).
+
+**Still not confirmed by a live order.** Verified against the database on 2026-08-09 02:04 UTC: the
+`confirm-order` fix was published at **2026-08-09 00:49 UTC**, and **zero** JET orders have arrived since
+(stores closed). All 23 `takeaway_accept` alerts sit between 2026-08-08 14:40 and 19:10 — every one of them
+*before* the fix, and all of them carrying `403 {"message":"Wrong status transition!"}`, the signature of the
+old `PATCH` call. So the fix is untested, **not** disproven. Today's first order is the real test; see §7.
 
 **Basis:** reverse-engineered. We are NOT a certified JET partner and have no official documentation. Two
 independent sources agree: JET's own restaurant-portal bundle (§2.1) and our production data (§2.2).
@@ -562,9 +567,11 @@ Chain: `Insert raw_orders` → **`Build Accept Body`** → **`Accept Takeaway Or
 
 ```js
 { food_preparation_duration: 15,
-  delivery_time_duration: (delivery_type === 'delivery' ? 25 : null),
+  delivery_time_duration: (delivery_type === 'delivery' ? 25 : 0),
   estimated_delivery_time: null }
 ```
+
+> Pickup changed `null` → `0` and published 2026-08-09 02:05:35 UTC, per §5.8.
 
 `Accept Takeaway Order` (HTTP) posts `{{ JSON.stringify($json.accept_body) }}` with the five headers of §5.1,
 `fullResponse: true`, `neverError: true`, timeout 10 s. `JSON.stringify` guarantees a genuine JSON `null`
@@ -585,7 +592,7 @@ and — **only when the fetched order status was `new`** — writes a `dlq_alert
 | Pickup `null` | ❌ **DEFECT — resolved in doc, not yet in code.** §5.8 proves the portal sends **`0`** for pickup, not `null`. No pickup order has ever reached us, so it has never fired. Must be fixed before pickup is enabled on any store |
 | Preorder | ✅ **answered** (§5.8) — the portal sends the plain restaurant defaults for preorders too; its intended clamp is dead code due to a date-fns misuse in JET's own client. Srova's behaviour already matches |
 | Token refresh timing | JET access tokens last ~5 min; we load the token at the top of the workflow. If a 401 appears, refresh immediately before the accept node |
-| Alert gate | fires only when fetched status was `new`; consider inverting to "alert unless `confirmed_at` is now set" so an unreadable status cannot silently suppress an alert |
+| Alert gate | ✅ **FIXED 2026-08-09 02:05 UTC** — now fail-closed. Was `detail.status === 'new'`, which went silent whenever the detail fetch returned anything unexpected. Now alerts unless the order is *readably* past `new`; an unknown status alarms and records `order_status_fetched: 'UNKNOWN'` |
 
 ---
 
