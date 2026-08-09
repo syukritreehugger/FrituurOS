@@ -681,3 +681,91 @@ are unverified.
 | 2026-08-08 19:28 UTC | switched to `POST /orders/{id}/confirm-order` after reverse-engineering the portal bundle |
 | 2026-08-09 | contract corroborated against production data; unknowns U1/U2/U5/U6/U7/U8 closed; node updated (null ETA, pickup null, portal headers, full response capture) |
 | next service | **first live test** — §7 |
+
+---
+
+## 10. Live troubleshooting — the JET pipeline map and one query that answers "what happened?"
+
+Added 2026-08-09 before the first post-fix service, so that a failure during service can be located in
+seconds instead of reconstructed afterwards.
+
+### 10.1 Every n8n workflow in the JET path
+
+Verified by querying n8n's own database rather than reading the UI, so nothing is missed:
+
+```sql
+SELECT id, active, name FROM workflow_entity
+WHERE (name ILIKE '%takeaway%' OR nodes::text LIKE '%live-orders-api.takeaway.com%')
+  AND NOT "isArchived";
+```
+
+| Workflow | ID | Role |
+|---|---|---|
+| `takeaway_poll_orders — Tipzakske (Aalst)` | `86E91MXlXNDO5DA6` | schedule 5 min → history → classify → sub-workflow |
+| `takeaway_poll_orders — Frietbooster (Berlare)` | `nhPFskveanP465z9` | idem |
+| `takeaway_poll_orders — Frietchalet (Dender)` | `e4R3OlqGpDVG3DW2` | idem |
+| `resolve_and_push_takeaway_order` | `XNeJaLEPB6uB94Ra` | **the only workflow that calls `confirm-order`** |
+| `takeaway_refresh_access_token` | `q1r0qcOalSrhzlrq` | returns `{access_token, location_key}` per `account_name` |
+| `monitor_takeaway_poll_health` | `tZw6iCD7hXDSKrxf` | 10 min → `check_takeaway_poll_health()` |
+| `populate_fact_takeaway_orders` | `qbBVvToZLtb4xC64` | reporting only, not in the order path |
+| `takeaway order` | `HXtbTrvnfUoVp5w7` | legacy, **inactive** — leave it that way |
+
+**The three pollers were diffed node-by-node and are structurally identical**; the only difference is
+`account_name` (`tipzakske` / `defrietbooster` / `frietchalet`). So a problem at one store and not another is
+volume or data, never workflow drift — do not go hunting for a config difference that does not exist.
+
+**Only one workflow accepts orders.** There is no second, forgotten accept path.
+
+### 10.2 The silent-loss hole this closes
+
+The poller's filter contains a deliberate guard:
+
+```sql
+AND i.placed_date >= NOW() - INTERVAL '30 minutes'
+```
+
+It exists so that a poller which has been down cannot wake up and re-push orders staff already printed by
+hand (Joef's standing rule). But until now an order older than that produced **zero rows and zero trace** —
+the order simply never existed as far as Srova was concerned, with no alert, because "nothing to do" and
+"we lost one" looked identical.
+
+The filter now classifies every order JET returns and records the verdict in
+`takeaway_poll_observations` before returning only the ones to process:
+
+| `decision` | Meaning |
+|---|---|
+| `process` | handed to `resolve_and_push_takeaway_order` |
+| `already_known` | already in `canonical_orders` — normal, the majority |
+| `aged_out` | **JET showed it to us and we did not take it.** Silent loss — now alarms |
+| `cancelled` | customer/JET cancelled it |
+| `status_<x>` | JET status outside `new`/`confirmed`/`kitchen` (e.g. `status_delivered`) |
+
+`check_takeaway_poll_health()` (already called every 10 minutes by `monitor_takeaway_poll_health`, so no
+workflow change was needed) now raises one `takeaway_aged_out` alert per lost order, keyed on `detail_id` so
+it cannot spam.
+
+### 10.3 The one query to run during service
+
+```sql
+SELECT * FROM public.v_takeaway_missed_orders LIMIT 20;
+```
+
+Everything JET showed us that we did **not** already have, newest first, with `reached_canonical` telling you
+whether it made it into the pipeline. An empty result during a busy service means nothing was dropped.
+
+### 10.4 Symptom → where to look
+
+| Joef says | Check | Meaning |
+|---|---|---|
+| "order didn't print" | `v_takeaway_missed_orders` for that reference | `aged_out` → poller missed its window; `process` → it entered the pipeline, so the problem is downstream (LS push), not JET |
+| "takeaway not accepting" | `dlq_alerts WHERE queue_name='takeaway_accept'` | `last_error.http_status` + `request_body` say exactly what JET refused. `403 pin_required` → PIN enabled on the tablet. `403 Wrong status transition!` → we are on the wrong endpoint again |
+| nothing at all is arriving | `dlq_alerts WHERE queue_name='takeaway_poll_silent'` | poller quiet > 45 min |
+| wrong/missing item on the ticket | `canonical_orders.items[].plu` for `UNMAPPED:`/`AMBIGUOUS:` | needs a mapping at `/menu` |
+| an order accepted late | compare `placed_date` with `canonical_orders.created_at` | up to one 5-minute poll tick is expected by design (§5.5) |
+
+### 10.5 Watch on the first live order
+
+`takeaway_poll_observations.location_key` is filled from an n8n `{{ }}` template inside the SQL. The node
+executed successfully after the change, which means n8n resolved the template (an unresolvable expression
+throws), but no order has yet exercised the INSERT itself. **On the first order, confirm `location_key` reads
+`LOC_AALST`/`LOC_BERLARE`/`LOC_DENDER` and not a literal `{{ … }}` string.**
