@@ -155,17 +155,25 @@
    "id": "accept-ta",
    "name": "Accept Takeaway Order",
    "type": "n8n-nodes-base.httpRequest",
+   "onError": "continueRegularOutput",
    "position": [
     1540,
     200
    ],
    "parameters": {
-    "url": "=https://live-orders-api.takeaway.com/api/orders/{{ $('Normalize Order').item.json.detail_id }}",
-    "method": "PATCH",
+    "url": "=https://live-orders-api.takeaway.com/api/orders/{{ $json.detail_id }}/confirm-order",
+    "method": "POST",
     "options": {
-     "timeout": 10000
+     "timeout": 10000,
+     "response": {
+      "response": {
+       "neverError": true,
+       "fullResponse": true,
+       "responseFormat": "json"
+      }
+     }
     },
-    "jsonBody": "={\"status\":\"confirmed\"}",
+    "jsonBody": "={{ JSON.stringify($json.accept_body) }}",
     "sendBody": true,
     "sendHeaders": true,
     "specifyBody": "json",
@@ -183,12 +191,19 @@
       {
        "name": "Accept",
        "value": "application/json"
+      },
+      {
+       "name": "X-Requested-With",
+       "value": "XMLHttpRequest"
+      },
+      {
+       "name": "X-Timezone",
+       "value": "Europe/Brussels"
       }
      ]
     }
    },
-   "typeVersion": 4.2,
-   "continueOnFail": true
+   "typeVersion": 4.2
   },
   {
    "id": "check-loc-active",
@@ -326,7 +341,7 @@
     420
    ],
    "parameters": {
-    "jsCode": "// JET accept failures were swallowed by continueOnFail for months; on 2026-08-07 JET\n// tightened its state machine (new -> in_delivery rejected with 403 Wrong status\n// transition) and a whole evening of orders sat unaccepted with zero alerts.\n// This branch makes any accept failure on a genuinely NEW order visible in dlq_alerts.\nconst acc = $input.first().json ?? {};\nconst detail = $('Pin Context').first().json.detail;\nconst env = $('When called').first().json;\nconst failed = !!acc.error;\nconst isNew = detail && detail.status === 'new';\nfunction lit(v) { return v == null || v === '' ? 'NULL' : \"'\" + String(v).replace(/'/g, \"''\") + \"'\"; }\nlet sql = 'SELECT 1';\nif (failed && isNew) {\n  const msg = String(acc.error.message || 'accept failed').slice(0, 200);\n  sql = \"INSERT INTO public.dlq_alerts (queue_name, msg_id, external_ref, source, location_key, last_error, attempt_count) VALUES ('takeaway_accept', \" + Number(detail.id) + \", \" + lit('Takeaway - ' + detail.public_reference) + \", 'takeaway', \" + lit(env.location_key) + \", jsonb_build_object('message', \" + lit('JET accept failed: ' + msg) + \", 'stage', 'takeaway_accept', 'runbook', 'Accept the order in the JET partner hub NOW, then check the accept API contract'), 1) ON CONFLICT (queue_name, msg_id) DO NOTHING\";\n}\nreturn [{ json: { sql } }];"
+    "jsCode": "// Accept-failure classifier. JET's own portal treats these statuses distinctly\n// (bundle error handler): 403 reason=pin_required, 403 message=\"Wrong status\n// transition!\", 422, 404, 500. We mirror that, and we capture the FULL response\n// body so one failure is enough to diagnose (2026-08-07 cost two evenings because\n// continueOnFail swallowed the body).\nconst resp = $input.first().json ?? {};\nconst detail = $('Pin Context').first().json.detail;\nconst env = $('When called').first().json;\n\nconst code = Number(resp.statusCode ?? resp.error?.status ?? 0);\nconst body = resp.body ?? resp.error?.message ?? null;\nconst bodyStr = typeof body === 'string' ? body : JSON.stringify(body ?? null);\nconst ok = code >= 200 && code < 300;\n\n// JET returns {\"reason\":\"pin_required\"} or {\"message\":\"Wrong status transition!\"}\nlet reason = '';\ntry {\n  const parsed = typeof body === 'string' ? JSON.parse(body) : body;\n  reason = parsed?.reason || parsed?.message || '';\n} catch (e) { reason = String(bodyStr).slice(0, 120); }\n\n// Only a genuinely NEW order that we failed to accept is an incident. If the order\n// already left 'new', staff (or an earlier run) accepted it \u2014 expected, not a failure.\nconst wasNew = detail && detail.status === 'new';\nconst alert = !ok && wasNew;\n\nfunction lit(v) { return v === null || v === undefined || v === '' ? 'NULL' : \"'\" + String(v).replace(/'/g, \"''\") + \"'\"; }\n\nlet sql = 'SELECT 1';\nif (alert) {\n  const err = JSON.stringify({\n    message: 'JET accept failed (HTTP ' + code + '): ' + String(reason).slice(0, 200),\n    stage: 'takeaway_accept',\n    http_status: code,\n    jet_reason: String(reason).slice(0, 200),\n    response_body: String(bodyStr).slice(0, 800),\n    request_body: JSON.stringify($('Build Accept Body').first().json.accept_body ?? null),\n    order_status_fetched: detail.status,\n    delivery_type: detail.delivery_type,\n    detail_id: detail.id,\n    runbook: code === 403 && /pin/i.test(reason)\n      ? 'JET PIN protection is enabled on this restaurant \u2014 accept on the tablet and disable the PIN, or implement X-pin-token.'\n      : 'Accept the order in the JET partner hub NOW, then compare request_body against docs/API Docs/TAKEAWAY-ACCEPT-CONTRACT.md',\n  });\n  sql = \"INSERT INTO public.dlq_alerts (queue_name, msg_id, external_ref, source, location_key, last_error, attempt_count) VALUES ('takeaway_accept', \"\n    + Number(detail.id) + \", \" + lit('Takeaway - ' + detail.public_reference) + \", 'takeaway', \"\n    + lit(env.location_key) + \", \" + lit(err) + \"::jsonb, 1) ON CONFLICT (queue_name, msg_id) DO NOTHING\";\n}\nreturn [{ json: { sql, accept_ok: ok, http_status: code, jet_reason: reason, alerted: alert } }];\n"
    },
    "typeVersion": 2
   },
@@ -351,6 +366,19 @@
     }
    },
    "typeVersion": 2.5
+  },
+  {
+   "id": "build-accept-body",
+   "name": "Build Accept Body",
+   "type": "n8n-nodes-base.code",
+   "position": [
+    1360,
+    200
+   ],
+   "parameters": {
+    "jsCode": "// Build the JET confirm-order payload.\n// Contract: docs/API Docs/TAKEAWAY-ACCEPT-CONTRACT.md (derived from JET's own portal\n// bundle + 10 production rows accepted by staff).\n//   food_preparation_duration : integer MINUTES\n//   delivery_time_duration    : integer MINUTES, or null when there is no delivery leg\n//   estimated_delivery_time   : the portal ALWAYS posts null here, because\n//     can_change_confirmed_time_of_order() forbids setting a time while the order is\n//     'new'. JET then derives restaurant_estimated_delivery_time = confirmed_at +\n//     prep + delivery (verified exactly on 7 production rows).\nconst d = $('Pin Context').first().json.detail;\nconst isDelivery = d.delivery_type === 'delivery';\n\nconst accept_body = {\n  food_preparation_duration: 15,\n  delivery_time_duration: isDelivery ? 25 : null,\n  estimated_delivery_time: null,\n};\nreturn [{ json: { accept_body, detail_id: d.id } }];\n"
+   },
+   "typeVersion": 2
   }
  ],
  "connections": {
@@ -521,7 +549,7 @@
  },
  "_meta": {
   "n8n_id": "XNeJaLEPB6uB94Ra",
-  "snapshot": "2026-08-08",
-  "note": "JET accept: new->confirmed (JET tightened state machine 2026-08-07, 403 Wrong status transition on new->in_delivery) + accept-failure alert branch"
+  "snapshot": "2026-08-09",
+  "note": "confirm-order contract applied: null ETA, null delivery duration for pickup, portal static headers, full response capture"
  }
 }
