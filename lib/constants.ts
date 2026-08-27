@@ -2,11 +2,13 @@
 // Postgres ENUM and dim_location.location_key exactly. Do not invent new keys here.
 
 export const LOCATIONS = [
-  { key: 'LOC_AALST',   name: 'Tipzakske',    city: 'Aalst',       postcode: '9300', companyId: 45905  },
-  { key: 'LOC_BERLARE', name: 'Frietbooster', city: 'Berlare',     postcode: '9290', companyId: 145352 },
-  { key: 'LOC_DENDER',  name: 'Frietchalet',  city: 'Dendermonde', postcode: '9200', companyId: 145351 },
-  // 46197 is de Lightspeed API companyId (JWT `cid`), geen billing-id.
-  { key: 'LOC_FRITURIST', name: 'De Friturist', city: 'Herzele', postcode: '9550', companyId: 46197 },
+  // companyId = de Lightspeed API-id (JWT-claim `cid`), NIET het billing/product-id
+  // uit een Lightspeed-factuur. Die twee lijken op elkaar en zijn eerder verwisseld;
+  // dim_location draagt sinds 14/05 de API-ids, deze lijst toont ze op /locations.
+  { key: 'LOC_AALST',     name: 'Tipzakske',    city: 'Aalst',       postcode: '9300', companyId: 45905 },
+  { key: 'LOC_BERLARE',   name: 'Frietbooster', city: 'Berlare',     postcode: '9290', companyId: 44982 },
+  { key: 'LOC_DENDER',    name: 'Frietchalet',  city: 'Dendermonde', postcode: '9200', companyId: 44981 },
+  { key: 'LOC_FRITURIST', name: 'De Friturist', city: 'Herzele',     postcode: '9550', companyId: 46197 },
 ] as const;
 
 export type LocationKey = typeof LOCATIONS[number]['key'];
