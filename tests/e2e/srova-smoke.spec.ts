@@ -226,12 +226,13 @@ describeAuth('Authenticated: Integration Store', () => {
     await loginVia(page);
   });
 
-  test('Integration Store page loads and shows 3 store cards', async ({ page }) => {
+  test('Integration Store page loads and shows all store cards', async ({ page }) => {
     await page.goto('/integrations');
     await expectNoCrash(page);
     await expect(page.getByText(/tipzakske/i).first()).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText(/frietbooster/i).first()).toBeVisible({ timeout: 10_000 });
     await expect(page.getByText(/frietchalet/i).first()).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/friturist/i).first()).toBeVisible({ timeout: 10_000 });
   });
 
   test('Tipzakske card shows Active state', async ({ page }) => {
@@ -262,5 +263,15 @@ describeAuth('Authenticated: Integration Store', () => {
       .first();
     await expect(frietchaletCard).toBeVisible({ timeout: 15_000 });
     await expect(frietchaletCard.getByText(/paused/i).first()).toBeVisible({ timeout: 10_000 });
+  });
+
+  test('Friturist card shows Active state', async ({ page }) => {
+    await page.goto('/integrations');
+    await expectNoCrash(page);
+    const frituristCard = page
+      .locator(':is(article, [class*="card"], div)', { hasText: /friturist/i })
+      .first();
+    await expect(frituristCard).toBeVisible({ timeout: 15_000 });
+    await expect(frituristCard.getByText(/accepting orders|active/i).first()).toBeVisible({ timeout: 10_000 });
   });
 });

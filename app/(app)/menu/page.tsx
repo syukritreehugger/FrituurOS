@@ -39,6 +39,7 @@ const SHOPIFY_DOMAIN_BY_LOC: Record<LocationKey, string> = {
   LOC_AALST: "tipzakske.myshopify.com",
   LOC_BERLARE: "frietbooster.myshopify.com",
   LOC_DENDER: "de-frietchalet.myshopify.com",
+  LOC_FRITURIST: "friturist.myshopify.com",
 };
 
 type Channel = "shopify" | "takeaway";

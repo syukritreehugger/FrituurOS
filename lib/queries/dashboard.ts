@@ -108,6 +108,7 @@ function getMockStats(): DashboardStats {
       { key: 'LOC_AALST',   total: 312, failed: 1, successRate: 99.7 },
       { key: 'LOC_BERLARE', total: 245, failed: 0, successRate: 100 },
       { key: 'LOC_DENDER',  total: 198, failed: 1, successRate: 99.5 },
+      { key: 'LOC_FRITURIST', total: 0, failed: 0, successRate: 100 },
     ],
     errorsBySource: [
       { source: 'shopify', count: 1 },

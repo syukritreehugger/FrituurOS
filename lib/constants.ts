@@ -5,6 +5,8 @@ export const LOCATIONS = [
   { key: 'LOC_AALST',   name: 'Tipzakske',    city: 'Aalst',       postcode: '9300', companyId: 45905  },
   { key: 'LOC_BERLARE', name: 'Frietbooster', city: 'Berlare',     postcode: '9290', companyId: 145352 },
   { key: 'LOC_DENDER',  name: 'Frietchalet',  city: 'Dendermonde', postcode: '9200', companyId: 145351 },
+  // 46197 is de Lightspeed API companyId (JWT `cid`), geen billing-id.
+  { key: 'LOC_FRITURIST', name: 'De Friturist', city: 'Herzele', postcode: '9550', companyId: 46197 },
 ] as const;
 
 export type LocationKey = typeof LOCATIONS[number]['key'];

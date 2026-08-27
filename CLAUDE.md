@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-**Srova** — a SaaS operations console that replaces Deliverect for restaurant groups. Real-time orders, menu sync, and POS integration health across Shopify, Takeaway.com, Lightspeed L-Series, and Shipday. Currently piloting at **Ghysels-Vagenende Frituur Group** (three Belgian frituur locations: Aalst, Berlare, Dender). It's a Next.js 16 app monitoring the order pipeline: Shopify/Takeaway.com orders flow through n8n workflows into Lightspeed L-Series POS, with Shipday for delivery dispatch. Supabase is the database (Postgres + RLS + Edge Functions).
+**Srova** — a SaaS operations console that replaces Deliverect for restaurant groups. Real-time orders, menu sync, and POS integration health across Shopify, Takeaway.com, Lightspeed L-Series, and Shipday. Currently piloting at **Ghysels-Vagenende Frituur Group** (four Belgian frituur locations: Aalst, Berlare, Dender, Herzele). It's a Next.js 16 app monitoring the order pipeline: Shopify/Takeaway.com orders flow through n8n workflows into Lightspeed L-Series POS, with Shipday for delivery dispatch. Supabase is the database (Postgres + RLS + Edge Functions).
 
 Branding: the product is **Srova** (mixed case, like Vercel/Linear). "FrituurOS" was the old internal name and may still appear in legacy infrastructure (VPS path, customer email fingerprint `@frituuros.internal` — these are deliberately preserved because changing them would break Lightspeed customer dedup for existing orders).
 
@@ -41,7 +41,7 @@ Copy `.env.example` to `.env.local`. Critical vars:
 - `NEXT_PUBLIC_DEV_SKIP_AUTH=1` — skips auth middleware + uses service-role client in dev
 - `NEXT_PUBLIC_USE_MOCK_DATA=1` — returns hardcoded mock data from query functions
 - `N8N_API_URL` / `N8N_API_KEY` — n8n instance for pipeline control
-- `SHOPIFY_AALST_DOMAIN` / `SHOPIFY_AALST_TOKEN` — per-location Shopify Admin API (same pattern for `BERLARE`, `DENDER`)
+- `SHOPIFY_AALST_DOMAIN` / `SHOPIFY_AALST_TOKEN` — per-location Shopify Admin API (same pattern for `BERLARE`, `DENDER`, `FRITURIST`)
 
 ## Architecture
 
@@ -57,7 +57,7 @@ Copy `.env.example` to `.env.local`. Critical vars:
 - `lib/n8n.ts` — REST client to control n8n workflows (activate/deactivate/status). Hardcoded workflow IDs for Shopify webhook handlers, LS pusher, and the poller.
 - `lib/shopify.ts` — Shopify Admin REST API client (`2024-10`). `getProductsForLocation(loc)` fetches all variants page-by-page; used by the `/menu` mapping page. Per-location config reads `SHOPIFY_*_DOMAIN` / `SHOPIFY_*_TOKEN` env vars.
 - `lib/queries/alerts.helpers.ts` — pure helpers: `humanStage()` (queue name → human label), `classify()` (attempt count → severity), `readError()` (JSONB → `ErrorJson`). Unit-tested in `alerts.helpers.test.ts`.
-- `lib/constants.ts` — canonical location keys (`LOC_AALST`, `LOC_BERLARE`, `LOC_DENDER`), order state enum, and UI tone mappings. These must match the Postgres ENUMs exactly.
+- `lib/constants.ts` — canonical location keys (`LOC_AALST`, `LOC_BERLARE`, `LOC_DENDER`, `LOC_FRITURIST`), order state enum, and UI tone mappings. These must match the Postgres ENUMs exactly.
 - `lib/data.ts` — static mock/dummy data for the dashboard skeleton (not used in production queries).
 
 **Database schema (hand-maintained types in `types/supabase.ts`):**

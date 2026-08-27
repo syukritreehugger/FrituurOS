@@ -84,7 +84,8 @@ export async function setTakeawayPollerActive(
   const auth = await assertManagement();
   if (!auth.ok) return auth;
 
-  // All three per-location pollers, not just Aalst (C3).
+  // Alle per-locatie JET-pollers, niet alleen Aalst (C3).
+  // LOC_FRITURIST heeft er geen: die zaak heeft geen takeaway.com-account.
   const res = await setTakeawayPollersActive(active);
 
   if (!res.ok) return { ok: false, error: res.error };

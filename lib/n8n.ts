@@ -18,6 +18,8 @@ export const TAKEAWAY_POLLER_IDS: Record<string, string> = {
   LOC_AALST: '86E91MXlXNDO5DA6',
   LOC_BERLARE: 'nhPFskveanP465z9',
   LOC_DENDER: 'e4R3OlqGpDVG3DW2',
+  // LOC_FRITURIST staat hier bewust NIET in: die zaak heeft geen takeaway.com-account
+  // (alleen afhalen via Shopify), dus er bestaat geen poller-workflow om te togglen.
 };
 export const TAKEAWAY_POLLER_ID = TAKEAWAY_POLLER_IDS['LOC_AALST'] as string;
 export const TAKEAWAY_TOKEN_REFRESH_ID = 'q1r0qcOalSrhzlrq';

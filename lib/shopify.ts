@@ -12,6 +12,7 @@ function configForLocation(loc: LocationKey): ShopifyConfig | null {
     LOC_AALST:   { domainEnv: 'SHOPIFY_AALST_DOMAIN',   tokenEnv: 'SHOPIFY_AALST_TOKEN' },
     LOC_BERLARE: { domainEnv: 'SHOPIFY_BERLARE_DOMAIN', tokenEnv: 'SHOPIFY_BERLARE_TOKEN' },
     LOC_DENDER:  { domainEnv: 'SHOPIFY_DENDER_DOMAIN',  tokenEnv: 'SHOPIFY_DENDER_TOKEN' },
+    LOC_FRITURIST: { domainEnv: 'SHOPIFY_FRITURIST_DOMAIN', tokenEnv: 'SHOPIFY_FRITURIST_TOKEN' },
   };
   const cfg = map[loc];
   const domain = process.env[cfg.domainEnv];

@@ -214,9 +214,11 @@ export function LocationsGrid({ data }: { data: LocationHealth[] }) {
   }
 
   const cols =
-    data.length >= 3
-      ? "md:grid-cols-3"
-      : "md:grid-cols-2"
+    data.length >= 4
+      ? "md:grid-cols-2 xl:grid-cols-4"
+      : data.length === 3
+        ? "md:grid-cols-3"
+        : "md:grid-cols-2"
 
   return (
     <div className={cn("grid grid-cols-1 gap-3", cols)}>

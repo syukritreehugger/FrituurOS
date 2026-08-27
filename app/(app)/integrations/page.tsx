@@ -124,7 +124,7 @@ export default async function IntegrationsPage() {
         description="Each store's master toggle gates ALL channels (Lightspeed POS + Shipday dispatch + Takeaway poller). Toggle OFF a store and nothing reaches its POS or driver pool, even if global toggles in /settings are ON."
       />
 
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2 xl:grid-cols-4">
         {rows.map((row) => {
           const shopify = shopifyChannel(row);
           const ls = lsChannel(row);

@@ -19,7 +19,7 @@ export default async function LocationsPage({
     <div className="flex flex-col gap-6">
       <PageHeader
         eyebrow="Locations"
-        title="3 frituur locations"
+        title={`${LOCATIONS.length} frituur locations`}
         description="Each Lightspeed companyId routes orders to its own kitchen. Postcode-based routing handles cross-location delivery overflow."
       />
 
