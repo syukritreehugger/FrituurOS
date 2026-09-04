@@ -1,0 +1,124 @@
+{
+  "name": "ls_receipt_watchdog",
+  "nodes": [
+    {
+      "id": "sched",
+      "name": "Schedule - Every 2 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 2
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "load",
+      "name": "Load Orders To Check",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Orders pushed 3-25 min ago at active stores that have not been settled by the watchdog yet.\n-- Lightspeed decides DONE vs NEW the instant a receipt is created, so one look at 3 min is enough.\nSELECT co.id::text AS canonical_id, co.ls_order_id, co.external_ref, co.source::text AS source, co.location_key,\n       to_char(co.ls_pushed_at AT TIME ZONE 'UTC','YYYY-MM-DD') AS d0,\n       to_char((co.ls_pushed_at - interval '1 day') AT TIME ZONE 'UTC','YYYY-MM-DD') AS d1,\n       round(EXTRACT(EPOCH FROM (now() - co.ls_pushed_at))/60)::int AS age_min,\n       t.access_token\nFROM public.canonical_orders co\nJOIN public.dim_location dl ON dl.location_key = co.location_key AND COALESCE(dl.is_active, true)\nJOIN LATERAL (SELECT access_token FROM public.ls_tokens x WHERE x.location_key = co.location_key ORDER BY updated_at DESC LIMIT 1) t ON true\nLEFT JOIN public.ls_receipt_watch w ON w.canonical_id = co.id\nWHERE co.ls_order_id IS NOT NULL\n  AND co.status IN ('ls_accepted','shipday_sent','complete')\n  AND co.ls_pushed_at BETWEEN now() - interval '25 minutes' AND now() - interval '3 minutes'\n  AND (w.canonical_id IS NULL OR (w.status NOT IN ('DONE','PAID') AND NOT w.alerted AND w.checks < 5))\nORDER BY co.ls_pushed_at\nLIMIT 20;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "9zc3jzWzgtSSJL0O",
+          "name": "Postgres Data Catalog"
+        }
+      }
+    },
+    {
+      "id": "check",
+      "name": "Check LS Receipt Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// For each pushed order: ask Lightspeed which receipt it became and what state that receipt\n// is in. DONE = the till took it and printed. NEW = the till never picked it up (Friturist\n// #1002, 2026-09-04). WAITINGFORPAYMENT = items != payment. Both are silent from Srova's\n// side because every step we own succeeded, so this is the only place they can be caught.\n// SQL is built as a literal here (no queryReplacement - see poison-message lessons).\nconst items = $input.all();\nfunction lit(v) { return v == null ? 'NULL' : \"'\" + String(v).replace(/'/g, \"''\") + \"'\"; }\nconst H = (t) => ({ Authorization: 'Bearer ' + t, Accept: 'application/json', 'User-Agent': 'SrovaWatchdog/1.0' });\nconst stmts = [];\nlet stuckCount = 0;\nfor (const it of items) {\n  const o = it.json;\n  let status = null, rid = null, err = null;\n  try {\n    const ord = await this.helpers.httpRequest({ url: `https://lightspeedapis.com/resto/rest/onlineordering/order/${o.ls_order_id}`, headers: H(o.access_token), json: true, timeout: 15000 });\n    rid = ord && ord.receiptId;\n    if (rid) {\n      for (const d of [o.d0, o.d1]) {\n        const r = await this.helpers.httpRequest({ url: `https://lightspeedapis.com/resto/rest/financial/receipt/?date=${d}&receiptId=${rid}`, headers: H(o.access_token), json: true, timeout: 15000 });\n        const res = (r && r.results) || [];\n        if (res.length) { status = res[0].status; break; }\n      }\n    }\n  } catch (e) { err = 'ERR:' + String(e.message || e).slice(0, 100); }\n  const stuck = status === 'NEW' || status === 'WAITINGFORPAYMENT';\n  stmts.push(`INSERT INTO public.ls_receipt_watch (canonical_id, ls_order_id, ls_receipt_id, status, alerted) VALUES (${lit(o.canonical_id)}::uuid, ${lit(o.ls_order_id)}, ${rid ? Number(rid) : 'NULL'}, ${lit(status || err || 'UNKNOWN')}, ${stuck}) ON CONFLICT (canonical_id) DO UPDATE SET status = EXCLUDED.status, ls_receipt_id = COALESCE(EXCLUDED.ls_receipt_id, ls_receipt_watch.ls_receipt_id), checks = ls_receipt_watch.checks + 1, alerted = ls_receipt_watch.alerted OR EXCLUDED.alerted, checked_at = now()`);\n  if (stuck) {\n    stuckCount++;\n    const msg = status === 'NEW'\n      ? `Order ${o.external_ref} is in Lightspeed complete, but the till has NOT picked it up after ${o.age_min} min - it will not print by itself. Open it on the POS and print manually.`\n      : `Order ${o.external_ref} is parked in Lightspeed as WAITING FOR PAYMENT (items do not match payment) - it will not print. Check it on the POS.`;\n    const errJson = JSON.stringify({ code: 'LS_RECEIPT_' + status, stage: 'ls_receipt_watchdog', message: msg, ls_order_id: o.ls_order_id, ls_receipt_id: rid, ls_receipt_status: status, age_min: o.age_min, runbook: 'Order data is complete in Lightspeed - print it manually from the POS. If this repeats at one store, the iPad app is missing online-order pickups.' });\n    stmts.push(`INSERT INTO public.dlq_alerts (queue_name, msg_id, canonical_order_id, external_ref, source, location_key, last_error, attempt_count) VALUES ('ls_receipt_stuck', ${Number(o.ls_order_id)}, ${lit(o.canonical_id)}::uuid, ${lit(o.external_ref)}, ${lit(o.source)}::public.order_source, ${lit(o.location_key)}, ${lit(errJson)}::jsonb, 1) ON CONFLICT (queue_name, msg_id) DO NOTHING`);\n  }\n}\n// One statement only: chain every INSERT as a data-modifying CTE. Avoids relying on\n// multi-statement support in the Postgres node.\nconst sql = stmts.length\n  ? 'WITH ' + stmts.map((s, i) => `s${i} AS (${s} RETURNING 1)`).join(',\\n') + '\\nSELECT ' + stmts.length + ' AS statements'\n  : 'SELECT 0 AS statements';\nreturn [{ json: { sql, checked: items.length, stuck: stuckCount } }];"
+      }
+    },
+    {
+      "id": "apply",
+      "name": "Record + Alert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        720,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "9zc3jzWzgtSSJL0O",
+          "name": "Postgres Data Catalog"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Schedule - Every 2 Min": {
+      "main": [
+        [
+          {
+            "node": "Load Orders To Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Orders To Check": {
+      "main": [
+        [
+          {
+            "node": "Check LS Receipt Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check LS Receipt Status": {
+      "main": [
+        [
+          {
+            "node": "Record + Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Brussels",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  }
+}

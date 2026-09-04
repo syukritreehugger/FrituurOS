@@ -1,0 +1,116 @@
+{
+  "name": "monitor_order_blocking_alerts",
+  "nodes": [
+    {
+      "id": "sched",
+      "name": "Schedule - Every 3 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "claim",
+      "name": "Claim Unnotified Alerts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Claim atomically: the INSERT is what makes a row ours, so two overlapping runs\n-- can never send the same alert twice. Service-hours guard keeps it from waking\n-- anyone at 04:00 for something the kitchen cannot act on anyway.\nWITH candidates AS (\n  SELECT v.* FROM public.v_dlq_alerts_needing_human v\n  WHERE EXTRACT(HOUR FROM now() AT TIME ZONE 'Europe/Brussels')::int BETWEEN 10 AND 23\n  ORDER BY v.created_at\n  LIMIT 5\n),\nclaimed AS (\n  INSERT INTO public.dlq_alert_notifications (dlq_alert_id, channel)\n  SELECT c.id, 'whatsapp' FROM candidates c\n  ON CONFLICT (dlq_alert_id) DO NOTHING\n  RETURNING dlq_alert_id\n)\nSELECT c.id,\n       CASE c.location_key\n         WHEN 'LOC_AALST'   THEN 'Tipzakske'\n         WHEN 'LOC_BERLARE' THEN 'Frietbooster'\n         WHEN 'LOC_DENDER'  THEN 'Frietchalet'\n         ELSE COALESCE(c.location_key,'?') END AS store_key,\n       left(\n         CASE WHEN c.queue_name = 'ls_receipt_stuck' THEN ''\n              ELSE 'Order ' || COALESCE(replace(c.external_ref,'Takeaway - ',''),'?') || ' did NOT reach the POS. ' END\n         || CASE\n              WHEN c.queue_name = 'q_orders_push_ls'   THEN 'Reason: ' || left(c.message,90)\n              WHEN c.queue_name = 'takeaway_accept'    THEN 'Takeaway would not accept it automatically.'\n              WHEN c.queue_name = 'takeaway_aged_out'  THEN 'It was on Takeaway but we picked it up too late.'\n              WHEN c.queue_name = 'q_orders_push_shipday' THEN 'Delivery dispatch failed: ' || left(c.message,80)\n              WHEN c.queue_name = 'ls_receipt_stuck'   THEN left(c.message,200)\n              ELSE left(c.message,90) END\n         || CASE WHEN c.queue_name = 'ls_receipt_stuck' THEN '' ELSE ' Please check the tablet and handle it manually.' END\n       , 300) AS message_text\nFROM candidates c\nJOIN claimed cl ON cl.dlq_alert_id = c.id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "9zc3jzWzgtSSJL0O",
+          "name": "Postgres Data Catalog"
+        }
+      }
+    },
+    {
+      "id": "notify",
+      "name": "WhatsApp Joef",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        300
+      ],
+      "parameters": {
+        "template": "ops_alert_v1|en",
+        "components": {
+          "component": [
+            {
+              "bodyParameters": {
+                "parameter": [
+                  {
+                    "text": "={{ $json.store_key }}"
+                  },
+                  {
+                    "text": "={{ $json.message_text }}"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "phoneNumberId": "944453325419385",
+        "recipientPhoneNumber": "32468316769"
+      },
+      "credentials": {
+        "whatsAppApi": {
+          "id": "kURKFujNeDRzmUan",
+          "name": "WhatsApp frietbooster"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Schedule - Every 3 Min": {
+      "main": [
+        [
+          {
+            "node": "Claim Unnotified Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Unnotified Alerts": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp Joef",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Brussels",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  }
+}
